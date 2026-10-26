@@ -1,5 +1,5 @@
 --[[
-UwUNCTT 2.2 | Credits: nctt | Mobile controls first / PC fallback
+UwUNCTT 2.3 | Credits: nctt | Separate PC / Mobile Farm profiles
 
 PHẠM VI THỰC TẾ
   Đây là menu client tự dựng, không tải UI hay thư viện từ bên ngoài.
@@ -42,6 +42,8 @@ API references:
 ]]
 
 -- 01. Services, capability detection, runtime ownership.
+local LaunchProfile = ...
+if LaunchProfile ~= "PC" and LaunchProfile ~= "Mobile" then LaunchProfile = nil end
 local Players = game:GetService("Players")
 local Run = game:GetService("RunService")
 local Input = game:GetService("UserInputService")
@@ -105,11 +107,15 @@ local App = {
     platform = "Tự động", actionButtons = {}, autoButtons = {}, buttonModes = {},
     touchDevice = Input.TouchEnabled == true, flyTouches = {up = {}, down = {}},
     lastAction = -math.huge, manualUntil = 0, lastGuiPaint = -math.huge,
+    buildProfile = LaunchProfile, farmReady = false, pendingAction = nil, comboCount = 0,
+    confirmed = {M1 = 0}, m1Misses = 0, preflightTries = 0, skillRetry = {},
+    reactedTracks = setmetatable({}, {__mode = "k"}), guardAt = -math.huge,
     logicAt = 0, groundAt = 0, localAt = 0, espAt = 0, fpsFrames = 0, fpsTime = 0, fps = 0,
     flags = {
         safe = false, anonymous = false, antiVoid = false, hidden = false,
         lock = false, m1 = false, skills = false, switchAwake = false, missingInactive = false,
         farm = false, farmSkills = true, farmPaused = false,
+        farmGuard = true, farmAim = true,
         block = false, dodge = false, ultDodge = false, loopEmote = true,
         speed = false, fly = false, dash = false, stabilize = false,
         esp = false, boxes = true, tracers = false, chams = true,
@@ -120,9 +126,11 @@ local App = {
         retreat = 30, voidY = -50, m1Gap = 0.24, skillGap = 0.45,
         espDistance = 500, fpsCap = 120, dashLength = 12,
         targetRange = 500, attackRange = 6.5, teleInterval = 0.2, guiFade = 55,
+        comboM1 = 3, feedbackWait = 0.9, guardRange = 10, guardStep = 10,
     },
     targetMode = "Chọn thủ công", ultMode = "Ra xa", aliasSerial = 0, aliases = {},
 }
+App.farmProfile = LaunchProfile or (App.touchDevice and "Mobile" or "PC")
 Env[RUNTIME_KEY] = App
 local function disconnect(list)
     for _, connection in ipairs(list or {}) do pcall(function() connection:Disconnect() end) end
@@ -207,6 +215,8 @@ end
 local virtualKeys = {One = 0x31, Two = 0x32, Three = 0x33, Four = 0x34, F = 0x46}
 local skillSlots = {One = "1", Two = "2", Three = "3", Four = "4"}
 function App.isMobile()
+    if App.flags.farm then return App.farmProfile == "Mobile" end
+    if App.buildProfile then return App.buildProfile == "Mobile" end
     if App.platform == "Điện thoại" then return true end
     if App.platform == "PC" then return false end
     return App.touchDevice
@@ -253,7 +263,13 @@ function App.punchButton()
     for _, button in ipairs(App.gameButtons()) do
         local name = string.lower(button.Name):gsub("[^%w]", "")
         local text = button:IsA("TextButton") and string.lower(button.Text):gsub("%s", "") or ""
-        if names[name] or names[text] then candidate, count = button, count + 1 end
+        local matched, parent = names[name] or names[text], button.Parent
+        for _ = 1, 3 do
+            if not parent or parent == PlayerGui then break end
+            if names[string.lower(parent.Name):gsub("[^%w]", "")] then matched = true end
+            parent = parent.Parent
+        end
+        if matched and App.hasGameHandler(button) ~= false then candidate, count = button, count + 1 end
     end
     if count == 1 then App.autoPunch = candidate; return candidate end
     return nil
@@ -293,11 +309,25 @@ function App.actionButton(key)
                 end
             end
         end
+        local handlers = App.hasGameHandler(button)
+        if rank > 0 and handlers == true then rank = rank + 20
+        elseif handlers == false then rank = 0 end
         if rank > score then best, score, tied = button, rank, false
         elseif rank > 0 and rank == score then tied = true end
     end
     if best and not tied then App.autoButtons[key] = best; return best end
     return nil
+end
+function App.hasGameHandler(button)
+    if not Caps.connections then return nil end
+    local unknown = false
+    for _, event in ipairs({"Activated", "MouseButton1Down", "MouseButton1Click", "InputBegan", "TouchTap"}) do
+        local result = App.guiHasHandlers(button[event])
+        if result then return true end
+        if result == nil then unknown = true end
+    end
+    if unknown then return nil end
+    return false
 end
 function App.guiHasHandlers(signal)
     if not Caps.connections then return nil end
@@ -647,6 +677,9 @@ function App.movementTick(dt, now)
         root.AssemblyAngularVelocity = Vector3.zero
     end
     local goal = App.goal
+    if App.flags.farm and App.farmReady and App.flags.farmAim and not App.flags.farmPaused and not App.panel.Visible then
+        App.patch("aim", humanoid, "AutoRotate", false)
+    else App.restore("aim") end
     if goal then
         if goal.expires < now then App.goal = nil; return end
         if not root.Anchored then
@@ -724,23 +757,156 @@ function App.farmReport(phase, reason, target, distance)
     App.farmDistance = distance
     if App.refreshFarmUI then App.refreshFarmUI() end
 end
-function App.startFarm()
+function App.actionAnimation(track)
+    if not track or track.Looped then return false end
+    local priority = track.Priority and track.Priority.Name or ""
+    if priority ~= "Action" and priority ~= "Action2" and priority ~= "Action3" and priority ~= "Action4" then return false end
+    local name = string.lower(track.Animation and track.Animation.Name or "")
+    for _, word in ipairs({"idle", "walk", "run", "jump", "fall", "swim", "emote", "dance", "pose", "stun", "hurt", "ragdoll"}) do
+        if name:find(word, 1, true) then return false end
+    end
+    return true
+end
+function App.confirmAction(source)
+    local pending = App.pendingAction
+    if not pending then return end
+    App.pendingAction = nil
+    App.confirmed[pending.key] = (App.confirmed[pending.key] or 0) + 1
+    App.feedbackSource, App.feedbackAt = source, os.clock()
+    if pending.key == "M1" then
+        App.farmReady, App.m1Misses = true, 0
+        if pending.phase ~= "preflight" then App.comboCount = App.comboCount + 1 end
+    else App.comboCount = 0 end
+end
+function App.observeSelf(track)
+    local pending = App.pendingAction
+    if not pending or os.clock() - pending.at > App.values.feedbackWait then return end
+    local _, humanoid = App.parts(Me)
+    if humanoid and humanoid.Health >= pending.health and App.actionAnimation(track) then App.confirmAction("AnimationPlayed phía mình") end
+end
+function App.sendCombat(key, now, phase)
+    local _, humanoid = App.parts(Me)
+    App.pendingAction = {key = key, at = now, phase = phase, health = humanoid and humanoid.Health or 0}
+    local ok, reason, fatal = App.press(key, 0.065, "combat")
+    if ok then
+        App.lastAction = now
+        if key == "M1" then App.farmSent = App.farmSent + 1; App.lastAttack = now
+        else App.lastSkill = now; App.skillRetry[key] = now + 1.6; App.comboCount = 0 end
+    else App.pendingAction = nil end
+    return ok, reason, fatal
+end
+function App.retreatFrom(player, now, reason)
+    local _, _, mine = App.parts(Me)
+    local _, _, enemy = App.parts(player)
+    if not mine or mine.Anchored then return false end
+    App.releaseAll(); App.pendingAction = nil; App.restore("aim")
+    local point
+    if enemy then
+        local away = mine.Position - enemy.Position
+        away = Vector3.new(away.X, 0, away.Z)
+        if away.Magnitude < 0.1 then away = enemy.CFrame.RightVector end
+        local side = (math.floor(now * 10) % 2 == 0) and 1 or -1
+        point = mine.Position + away.Unit * App.values.guardStep + enemy.CFrame.RightVector * side * 4
+    elseif App.farmOrigin then point = App.farmOrigin.Position end
+    local floor = point and App.ground(point)
+    App.pauseUntil = math.max(App.pauseUntil, now + 0.45)
+    App.guardAt = now
+    if floor then App.moveTo(App.face(floor, enemy and enemy.Position or floor + mine.CFrame.LookVector), 240, 0.45, App.teleMode == "Nhanh") end
+    App.farmReport("RÚT / NÉ", reason or "Phản ứng theo hoạt ảnh gần; chưa xác định hitbox.", player)
+    return floor ~= nil
+end
+function App.pauseFarm(reason, withdraw)
+    App.flags.farmPaused = true; App.pendingAction = nil; App.releaseAll(); App.restore("aim")
+    if App.goal and App.goal.priority == 10 then App.goal = nil end
+    if withdraw then App.retreatFrom(App.current and Players:GetPlayerByUserId(App.current), os.clock(), reason) end
+    App.farmReport("FARM ĐÃ TẠM DỪNG", reason)
+    App.notify("Farm " .. App.farmProfile .. " tạm dừng", reason)
+    App.lastGuiPaint = -math.huge; App.refresh()
+end
+function App.feedbackTick(now)
+    local pending = App.pendingAction
+    if pending and now - pending.at >= App.values.feedbackWait then
+        App.pendingAction = nil
+        if pending.key == "M1" then
+            App.m1Misses = App.m1Misses + 1
+            if App.m1Misses >= 3 then
+                App.pauseFarm("Nút đã được gọi nhưng không thấy nhân vật ra đòn. Gán lại M1; đã ngừng áp sát.", App.farmReady)
+            end
+        end
+    end
+end
+function App.preflightTick(now)
+    if App.farmReady or App.flags.farmPaused then return App.farmReady end
+    if App.pendingAction then return false end
+    if App.farmProfile == "Mobile" and not App.actionButton("M1") then
+        App.captureAction = "M1"
+        App.farmReport("CHẠM NÚT ĐẤM", "Chạm nút đấm thật một lần để gán. Chưa áp sát mục tiêu.")
+        App.notify("Farm Mobile", "Chạm nút ĐẤM thật của game một lần. Chưa tele khi chưa kiểm tra input.")
+        return false
+    end
+    if now - App.lastAction < 0.2 then return false end
+    local ok, reason, fatal = App.sendCombat("M1", now, "preflight")
+    App.preflightTries = App.preflightTries + 1
+    if not ok then
+        App.lastAction = now
+        if fatal then App.pauseFarm(reason, false)
+        elseif App.preflightTries >= 3 then App.pauseFarm(reason .. " · Đã dừng kiểm tra; gán lại nút trước khi tiếp tục.", false)
+        else App.farmReport("CHỜ NÚT ĐÁNH", reason) end
+    else App.farmReport(App.farmReady and "INPUT ĐÃ CÓ PHẢN HỒI" or "KIỂM TRA M1", "Đang kiểm tra hoạt ảnh ra đòn trước khi áp sát.") end
+    return App.farmReady
+end
+function App.buttonCooling(button)
+    if not button then return true end
+    for _, child in ipairs(button:GetDescendants()) do
+        local name = string.lower(child.Name):gsub("[^%w]", "")
+        if name == "cooldown" or name == "cooldowntext" or name == "cooldowntimer" then
+            if child:IsA("TextLabel") or child:IsA("TextButton") then
+                local value = tonumber(child.Text)
+                if child.Visible and value and value > 0 then return true end
+            elseif child:IsA("GuiObject") and child.Visible and child.AbsoluteSize.Y > 1 then return true end
+        end
+    end
+    return false
+end
+function App.nextSkill(now)
+    local keys = {"One", "Two", "Three", "Four"}
+    for offset = 0, 3 do
+        local index = (App.skillIndex - 1 + offset) % 4 + 1
+        local key = keys[index]
+        local button = App.isMobile() and App.actionButton(key) or nil
+        if now >= (App.skillRetry[key] or 0) and (not App.isMobile() or (button and not App.buttonCooling(button))) then
+            App.skillIndex = index % 4 + 1; return key
+        end
+    end
+    return nil
+end
+function App.startFarm(profile)
+    profile = profile or App.buildProfile or App.farmProfile
+    if profile ~= "PC" and profile ~= "Mobile" then profile = App.isMobile() and "Mobile" or "PC" end
+    if App.buildProfile and profile ~= App.buildProfile then return false end
     App.releaseAll(); App.goal = nil; App.stopEmote()
+    App.rejected, App.inputFailures, App.lastInputError = {}, {}, ""
+    App.restore("aim"); App.farmProfile = profile; App.counterThreat = nil
+    if profile == "PC" then App.m1Mode = "Input" end
     if App.flags.fly then App.flags.fly = false; App.stopFly() end
     if App.targetMode == "Chọn thủ công" and not App.parts(App.selectedPlayer()) then App.targetMode = "Gần nhất" end
     App.current = App.targetMode == "Chọn thủ công" and App.selected or nil
     App.flags.farm, App.flags.farmPaused = true, false
     App.flags.lock, App.flags.m1, App.flags.skills = true, true, App.flags.farmSkills
+    App.farmReady, App.pendingAction, App.comboCount, App.m1Misses, App.preflightTries = false, nil, 0, 0, 0
+    App.confirmed, App.skillRetry = {M1 = 0}, {}
+    local _, humanoid, root = App.parts(Me)
+    App.farmOrigin, App.selfHealth, App.selfHumanoid = root and root.CFrame, humanoid and humanoid.Health, humanoid
     App.lastAttack, App.lastSkill, App.lastFollowAt, App.lastAction = -math.huge, -math.huge, -math.huge, -math.huge
     App.farmSent, App.farmTargetId, App.farmHealth = 0, nil, nil
-    App.farmReport("ĐANG TÌM", "Tự chọn mục tiêu và tiếp cận.")
+    App.farmReport("KIỂM TRA " .. profile, "Kiểm tra M1 trước, sau đó mới khóa và tiếp cận.")
     App.showMenu(false); App.refresh()
     App.notify("Auto Farm đã bật", "MENU để chỉnh · DỪNG để ngừng. Nút cảm ứng của game được giữ nguyên.")
 end
 function App.stopFarm(reason, failed)
     App.flags.farm, App.flags.farmPaused = false, false
     App.flags.lock, App.flags.m1, App.flags.skills = false, false, false
-    App.releaseAll("combat")
+    App.releaseAll("combat"); App.pendingAction = nil; App.farmReady = false; App.counterThreat = nil; App.restore("aim")
     if App.goal and App.goal.priority == 10 then App.goal = nil end
     App.current = nil
     App.farmReport(failed and "INPUT KHÔNG KHẢ DỤNG" or "ĐÃ DỪNG", reason or "Bấm BẮT ĐẦU AUTO FARM.")
@@ -749,10 +915,11 @@ function App.stopFarm(reason, failed)
 end
 function App.diagnostics()
     local lines = {
-        "UwUNCTT 2.2 | " .. executor .. (App.isMobile() and " | MOBILE: không gửi phím/chuột PC" or " | PC"),
+        "UwUNCTT 2.3 | Farm " .. App.farmProfile .. " | " .. executor .. (App.isMobile() and " | MOBILE: không gửi phím/chuột PC" or " | PC"),
         "Farm: " .. App.farmPhase .. " | " .. App.farmReason,
         "M1: " .. App.m1Mode .. " | backend: " .. App.inputBackend,
         "Đã gửi M1: " .. tostring(App.farmSent),
+        "M1 có hoạt ảnh: " .. tostring(App.confirmed.M1) .. " | input đã kiểm tra: " .. tostring(App.farmReady),
         "VIM bị chặn: " .. tostring(App.rejected.mouse == true),
         "firesignal: " .. tostring(Caps.signal ~= nil) .. " | getconnections: " .. tostring(Caps.connections ~= nil),
         "mouse1click: " .. tostring(Caps.click ~= nil),
@@ -837,9 +1004,16 @@ function App.followTarget(target, now)
     App.followOkay = true
     return true
 end
+function App.counterActive(now)
+    local threat = App.counterThreat
+    if threat and threat.track.IsPlaying and now < threat.expires then return true end
+    App.counterThreat = nil; return false
+end
 function App.followTick(now)
     if not (App.flags.lock or App.flags.farm) or App.flags.fly or App.panel.Visible
         or App.flags.farmPaused or App.captureAction or now < App.pauseUntil or App.focused == false then return end
+    if App.flags.farm and not App.farmReady then return end
+    if App.counterActive(now) then return end
     local target = App.chooseTarget()
     if not target then
         if App.goal and App.goal.priority == 10 then App.goal = nil end
@@ -849,13 +1023,28 @@ function App.followTick(now)
 end
 function App.react(player, track, id, now)
     local rule = App.animations[id]
-    if not rule or not track.IsPlaying or not App.panel or App.panel.Visible then return end
+    if not track.IsPlaying or not App.panel or App.panel.Visible or App.reactedTracks[track] then return end
     if App.focused == false or Input:GetFocusedTextBox() or GuiService.MenuIsOpen then return end
     local _, _, root = App.parts(player)
     local _, _, myRoot = App.parts(Me)
     if not root or not myRoot or (root.Position - myRoot.Position).Magnitude > App.values.radius then return end
-    local dodge = (rule.kind == "Counter" and App.flags.dodge) or (rule.kind == "Ultimate" and App.flags.ultDodge)
+    if not rule or rule.kind == "M1" then
+        if not (App.flags.farm and App.farmReady and App.flags.farmGuard) or App.flags.farmPaused
+            or (not rule and not App.actionAnimation(track)) or now - App.guardAt < 0.55 then return end
+        local delta = myRoot.Position - root.Position
+        if delta.Magnitude > App.values.guardRange or delta.Magnitude < 0.1 then return end
+        local forward = root.CFrame.LookVector
+        local facing = (forward.X * delta.X + forward.Z * delta.Z) / delta.Magnitude
+        if facing < 0.15 then return end
+        App.reactedTracks[track] = true
+        App.retreatFrom(player, now, rule and "Né M1 theo ID đã gán." or "Né thử: hoạt ảnh Action gần đang hướng về mình.")
+        return
+    end
+    local guard = App.flags.farm and App.farmReady and App.flags.farmGuard and not App.flags.farmPaused
+    local dodge = (rule.kind == "Counter" and (App.flags.dodge or guard)) or (rule.kind == "Ultimate" and (App.flags.ultDodge or guard))
     if dodge then
+        App.reactedTracks[track] = true
+        if rule.kind == "Counter" then App.counterThreat = {track = track, expires = now + 6} end
         App.pauseUntil = math.max(App.pauseUntil, now + 0.65)
         App.releaseAll()
         if now - App.reactionAt < (App.flags.safe and 1.1 or 0.65) then return end
@@ -873,14 +1062,18 @@ function App.react(player, track, id, now)
         local ground = App.ground(position)
         if ground then App.moveTo(App.face(ground, root.Position), 200, 0.85, false) end
         App.notify(rule.kind .. " được nhận diện", ground and "Tạm dừng auto đánh, thử rút khỏi chiêu." or "Đã dừng auto đánh; không thấy chỗ đứng để rút.")
-    elseif rule.kind == "Block" and App.flags.block and now >= App.pauseUntil then
+    elseif rule.kind == "Block" and (App.flags.block or guard) and now >= App.pauseUntil then
         App.releaseAll("combat")
         local ok, reason, fatal = App.press("F", 0.35, "block")
+        if ok then App.reactedTracks[track] = true end
+        if not ok and guard then App.reactedTracks[track] = true; App.retreatFrom(player, now, "Không gửi được Block; thử rút khỏi chiêu đã gán.") end
         if not ok and fatal then App.flags.block = false; App.refresh(); App.notify("Auto Block đã tắt", reason) end
     end
 end
-function App.observe(player, track)
-    if not App.alive or player == Me then return end
+function App.observe(player, track, started)
+    if not App.alive then return end
+    if player == Me then if started then App.observeSelf(track) end; return end
+    if started then App.reactedTracks[track] = nil end
     local id = App.animationId(track)
     if not id then return end
     if not App.seenTrack[track] then
@@ -908,7 +1101,7 @@ function App.watch(player)
             if object:IsA("Animator") and not watcher.animators[object] then
                 watcher.animators[object] = true
                 App.bind(object.AnimationPlayed, function(track)
-                    App.try("Quan sát hoạt ảnh", App.observe, player, track)
+                    App.try("Quan sát hoạt ảnh", App.observe, player, track, true)
                 end, watcher.character)
             end
         end
@@ -931,7 +1124,7 @@ function App.unwatch(player)
     if App.selected == player.UserId then App.selected = nil end
 end
 function App.reactionTick(now)
-    if not (App.flags.block or App.flags.dodge or App.flags.ultDodge) then return end
+    if not (App.flags.block or App.flags.dodge or App.flags.ultDodge or (App.flags.farm and App.flags.farmGuard)) then return end
     local _, _, myRoot = App.parts(Me)
     if not myRoot then return end
     for _, player in ipairs(Players:GetPlayers()) do
@@ -948,29 +1141,47 @@ function App.reactionTick(now)
 end
 function App.combatTick(now)
     if not (App.flags.farm or App.flags.lock or App.flags.m1 or App.flags.skills) then return end
+    if App.flags.farm then App.feedbackTick(now) end
     if App.panel.Visible or App.flags.farmPaused or App.captureAction then
         App.releaseAll("combat")
         if App.goal and App.goal.priority == 10 then App.goal = nil end
         if App.flags.farm then App.farmReport("TẠM DỪNG", App.panel.Visible and "Thu gọn menu để tiếp tục." or "Bấm TIẾP TỤC FARM.") end
         return
     end
-    if now < App.pauseUntil or App.inputs.F then
+    if now < App.pauseUntil or App.inputs.F or App.counterActive(now) then
         if App.flags.farm then App.farmReport("ĐANG NÉ / BLOCK", "Tạm ngừng gửi đòn đánh.") end
         return
     end
     local _, humanoid, myRoot = App.parts(Me)
     if not myRoot then
+        App.farmReady, App.pendingAction = false, nil
         App.releaseAll("combat"); App.current = nil
         if App.goal and App.goal.priority == 10 then App.goal = nil end
         if App.flags.farm then App.farmReport("CHỜ HỒI SINH", "Nhân vật chưa sẵn sàng; sẽ tìm mục tiêu sau khi hồi sinh.") end
         return
     end
+    if App.flags.farm then
+        if App.selfHumanoid ~= humanoid then
+            App.selfHumanoid, App.selfHealth, App.farmReady, App.pendingAction = humanoid, humanoid.Health, false, nil
+        elseif App.flags.farmGuard and humanoid.Health < (App.selfHealth or humanoid.Health) then
+            App.selfHealth = humanoid.Health
+            if humanoid.Health <= 25 then
+                App.pauseFarm("HP thấp; đã dừng áp sát. Hồi phục rồi bấm tiếp tục.", true)
+            elseif now - App.guardAt >= 0.3 then
+                App.retreatFrom(App.current and Players:GetPlayerByUserId(App.current), now, "Vừa mất HP: nhả đòn, rút khỏi điểm bị đánh.")
+            end
+            return
+        end
+        App.selfHealth = humanoid.Health
+    end
     if myRoot.Anchored or humanoid.PlatformStand then
+        App.pendingAction = nil
         App.releaseAll("combat")
         if App.goal and App.goal.priority == 10 then App.goal = nil end
         if App.flags.farm then App.farmReport("CHỜ NHÂN VẬT", "Nhân vật đang bị neo hoặc khống chế.") end
         return
     end
+    if App.flags.farm and not App.preflightTick(now) then return end
     local target = App.chooseTarget()
     local _, targetHumanoid, root = App.parts(target)
     if not root then
@@ -999,21 +1210,22 @@ function App.combatTick(now)
         local reason = now - App.farmDamageAt > 7 and "Đã gửi M1 nhưng chưa thấy HP giảm; kiểm tra phương thức / trạng thái game." or "Đang gửi M1 trong tầm. Server quyết định damage và kill."
         App.farmReport("TRONG TẦM ĐÁNH", reason, target, distance)
     end
-    if now < App.manualUntil or now - App.lastAction < 0.09 then return end
+    if App.pendingAction or now < App.manualUntil or now - App.lastAction < 0.09 then return end
     for _, held in pairs(App.inputs) do if held.owner == "combat" then return end end
     -- Dispatch a single action per tick: do not stomp a skill with M1 in the same frame.
-    if App.flags.skills and now - App.lastSkill >= math.max(App.values.skillGap, App.flags.safe and 0.8 or 0.25) then
-        App.lastSkill = now
-        local keys = {"One", "Two", "Three", "Four"}
-        local ok, reason, fatal = App.press(keys[App.skillIndex], 0.065, "combat")
-        App.skillIndex = App.skillIndex % 4 + 1
-        if ok then App.lastAction = now; return end
-        if fatal then App.flags.skills = false; App.refresh(); App.notify("Auto Skill đã tắt", reason) end
+    if App.flags.skills and (not App.flags.farm or App.comboCount >= App.values.comboM1)
+        and now - App.lastSkill >= math.max(App.values.skillGap, App.flags.safe and 0.8 or 0.25) then
+        local key = App.nextSkill(now)
+        if key then
+            App.skillRetry[key] = now + 0.8
+            local ok = App.sendCombat(key, now, "combo")
+            if ok then return end
+        end
     end
     if App.flags.m1 and now - App.lastAttack >= math.max(App.values.m1Gap, App.flags.safe and 0.45 or 0.18) then
         App.lastAttack = now
-        local ok, reason, fatal = App.press("M1", 0.065, "combat")
-        if ok then App.lastAction = now; App.farmSent = App.farmSent + 1; if App.refreshFarmUI then App.refreshFarmUI() end
+        local ok, reason, fatal = App.sendCombat("M1", now, "combo")
+        if ok then if App.refreshFarmUI then App.refreshFarmUI() end
         elseif fatal then
             if App.flags.farm then App.stopFarm(reason, true); return
             else App.flags.m1 = false; App.refresh(); App.notify("Auto M1 đã tắt", reason) end
@@ -1165,7 +1377,7 @@ end
 function App.stopCombat()
     App.flags.farm, App.flags.farmPaused = false, false
     App.flags.m1, App.flags.skills, App.flags.block, App.flags.lock = false, false, false, false
-    App.releaseAll(); App.goal = nil
+    App.releaseAll(); App.goal = nil; App.pendingAction = nil; App.farmReady = false; App.restore("aim")
     App.farmReport("ĐÃ DỪNG", "Thao tác điều khiển khác đã dừng Farm.")
     App.refresh()
 end
@@ -1228,10 +1440,13 @@ function App.setFlag(key, enabled)
     App.notify(enabled and "Đã bật" or "Đã tắt", key == "safe" and "Chỉ giảm tần suất; không có bảo đảm chống ban." or key)
 end
 function App.stopAll(message)
+    local preferences = {safe = true, loopEmote = true, farmSkills = true, farmAim = true, farmGuard = true,
+        boxes = true, tracers = true, chams = true}
     for key, value in pairs(App.flags) do
-        if type(value) == "boolean" and key ~= "safe" and key ~= "loopEmote" then App.flags[key] = false end
+        if type(value) == "boolean" and not preferences[key] then App.flags[key] = false end
     end
     App.releaseAll(); App.stopFly(); App.stopEmote(); App.goal = nil; App.pauseUntil = 0
+    App.pendingAction, App.farmReady, App.counterThreat = nil, false, nil
     App.queue, App.queueIndex, App.keys = {}, 1, {}
     local groups = {}
     for name in pairs(App.bags) do table.insert(groups, name) end
@@ -1362,7 +1577,7 @@ App.new("TextLabel", {
 }, header)
 App.new("TextLabel", {
     Position = UDim2.fromOffset(13, 33), Size = UDim2.new(1, -26, 0, 16),
-    BackgroundTransparency = 1, Text = "nctt · v2.2 · " .. (App.isMobile() and "Mobile" or "PC") .. " · " .. executor,
+    BackgroundTransparency = 1, Text = "nctt · v2.3 · Farm " .. App.farmProfile .. " · " .. executor,
     Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.text, TextXAlignment = Enum.TextXAlignment.Left,
 }, header)
 local function headerButton(text, x, width, color)
@@ -1598,7 +1813,7 @@ function App.showMenu(visible)
     if visible then
         App.captureAction = nil
         if App.goal and App.goal.priority == 10 then App.goal = nil end
-        App.releaseAll()
+        App.releaseAll(); App.pendingAction = nil; App.restore("aim")
         if App.flags.farm then App.farmReport("TẠM DỪNG", "Thu gọn menu hoặc bấm TIẾP TỤC để chạy lại.") end
     end
     App.refresh()
@@ -1609,7 +1824,9 @@ table.insert(App.refreshers, function()
     floatingFly.Text = App.flags.fly and "BAY ✓" or "BAY"
     floatingFly.BackgroundColor3 = App.flags.fly and C.purple or C.row
 end)
-floatingFarm.Activated:Connect(function() if App.flags.farm then App.stopFarm() else App.startFarm() end end)
+floatingFarm.Activated:Connect(function()
+    if App.flags.farm and not App.flags.farmPaused then App.stopFarm() else App.startFarm() end
+end)
 floating.Activated:Connect(function() App.showMenu(not App.panel.Visible) end)
 floatingFly.Activated:Connect(function() App.setFlag("fly", not App.flags.fly); if App.flags.fly then App.showMenu(false) end end)
 floatingStop.Activated:Connect(function() App.stopAll("Đã tắt và khôi phục thay đổi.") end)
@@ -1622,11 +1839,11 @@ local combatPage, movePage, optimizePage = App.pages[2], App.pages[3], App.pages
 local counterPage, characterPage, mobilePage, protect = App.pages[5], App.pages[6], App.pages[7], App.pages[8]
 local emotePage = characterPage
 App.primaryFarm = App.action(homePage, "BẮT ĐẦU AUTO FARM", function()
-    if App.flags.farm then App.stopFarm() else App.startFarm() end
+    if App.flags.farm and not App.flags.farmPaused then App.stopFarm() else App.startFarm() end
 end)
 App.primaryFarm.Size, App.primaryFarm.TextSize = UDim2.new(1, 0, 0, 52), 15
 App.resumeFarm = App.action(homePage, "TIẾP TỤC • THU GỌN MENU", function()
-    if not App.flags.farm then App.startFarm()
+    if not App.flags.farm or App.flags.farmPaused then App.startFarm()
     else App.flags.farmPaused = false; App.showMenu(false); App.refresh() end
 end)
 App.farmStatusLabel = App.note(homePage, "Bấm BẮT ĐẦU AUTO FARM. Mặc định tự chọn người gần nhất nếu chưa chọn ai.")
@@ -1639,11 +1856,12 @@ function App.refreshFarmUI()
     local target = App.farmDisplayTarget
     local targetText = target and App.name(target) or "—"
     local distance = App.farmDistance and string.format(" · %.1f studs", App.farmDistance) or ""
-    App.primaryFarm.Text = App.flags.farm and "DỪNG AUTO FARM" or "BẮT ĐẦU AUTO FARM"
+    local profile = App.farmProfile == "Mobile" and "MOBILE" or "PC"
+    App.primaryFarm.Text = App.flags.farm and (App.flags.farmPaused and "KIỂM TRA LẠI & TIẾP TỤC" or "DỪNG FARM " .. profile) or "BẮT ĐẦU FARM " .. profile
     App.primaryFarm.BackgroundColor3 = App.flags.farm and C.red or C.purple
     App.resumeFarm.Text = App.flags.farm and "TIẾP TỤC • THU GỌN MENU" or "BẮT ĐẦU VỚI CÀI ĐẶT HIỆN TẠI"
-    App.farmStatusLabel.Text = App.farmPhase .. "\n" .. App.farmReason .. "\nMục tiêu: " .. targetText .. distance .. "\nM1 đã gửi: " .. tostring(App.farmSent) .. " · " .. App.inputBackend
-    floatingFarm.Text = App.flags.farm and "FARM ✓" or "FARM"
+    App.farmStatusLabel.Text = App.farmPhase .. "\n" .. App.farmReason .. "\nMục tiêu: " .. targetText .. distance .. "\nM1 thử: " .. tostring(App.farmSent) .. " · có hoạt ảnh: " .. tostring(App.confirmed.M1) .. " · " .. App.inputBackend
+    floatingFarm.Text = App.flags.farm and (App.flags.farmPaused and "TIẾP TỤC" or "DỪNG FARM") or "FARM " .. (profile == "MOBILE" and "MB" or "PC")
     floatingFarm.BackgroundColor3 = App.flags.farm and C.red or C.row
     App.farmBadge.Visible = App.flags.farm and not App.panel.Visible
     App.farmBadge.Text = App.farmPhase .. " · " .. targetText .. distance
@@ -1656,11 +1874,15 @@ end)
 App.cycle(homePage, "Auto tele", {"Nhanh", "Êm"}, function() return App.teleMode end, function(value)
     App.teleMode = value; App.lastFollowAt = -math.huge
 end)
-App.cycle(homePage, "Cách gửi M1 trên PC", {"Tự động", "Input", "GUI Nhấn/Thả", "GUI Activated"}, function() return App.m1Mode end, function(value)
+local pcM1Mode = App.cycle(homePage, "Cách gửi M1 trên PC", {"Tự động", "Input", "GUI Nhấn/Thả", "GUI Activated"}, function() return App.m1Mode end, function(value)
     App.releaseAll("combat"); App.m1Mode = value; App.rejected = {}; App.lastInputError = ""
     App.inputBackend = "Chưa gửi M1"; App.refreshFarmUI()
 end)
+pcM1Mode.Visible = App.buildProfile == nil
 App.toggle(homePage, "Kèm Skill 1–4 khi Farm", "farmSkills")
+App.toggle(homePage, "Giữ hướng đánh vào mục tiêu", "farmAim")
+App.toggle(homePage, "Rút khi mất HP / né hoạt ảnh gần (thử)", "farmGuard")
+App.slider(homePage, "Số M1 trước một chiêu", "comboM1", 1, 4, 1)
 App.slider(homePage, "Phạm vi tìm mục tiêu", "targetRange", 50, 1000, 25)
 App.slider(homePage, "Khoảng đứng sau lưng", "distance", 3, 8, 0.5)
 App.slider(homePage, "Tầm bắt đầu M1", "attackRange", 4, 8, 0.5)
@@ -1695,9 +1917,12 @@ App.action(homePage, "XEM / SAO CHÉP CHẨN ĐOÁN", function()
     if clipboard then pcall(clipboard, report); App.notify("Chẩn đoán", "Đã thử sao chép log để bạn gửi khi báo lỗi.") end
 end)
 App.note(mobilePage, "Nút điện thoại được giữ nguyên. Nếu auto không nhận đúng nút: bấm GÁN rồi chạm nút thật của game một lần. Không dùng phím 1–4 giả trên mobile.")
-App.cycle(mobilePage, "Thiết bị", {"Tự động", "Điện thoại", "PC"}, function() return App.platform end, function(value)
-    App.releaseAll(); App.platform = value; App.rejected = {}; App.fit(true)
-end)
+if not App.buildProfile then
+    App.cycle(mobilePage, "Thiết bị", {"Tự động", "Điện thoại", "PC"}, function() return App.platform end, function(value)
+        App.stopFarm(); App.releaseAll(); App.platform = value
+        App.farmProfile = App.isMobile() and "Mobile" or "PC"; App.rejected = {}; App.fit(true)
+    end)
+else App.note(mobilePage, "BẢN FARM " .. App.buildProfile .. " · Không tự đổi sang bộ input của thiết bị khác.") end
 App.mobileBindingStatus = App.note(mobilePage, "")
 function App.refreshBindings()
     local lines = {App.isMobile() and "MOBILE · phím/chuột PC đã khóa" or "PC · input theo executor"}
@@ -1734,6 +1959,7 @@ function App.handleTouch(input)
                 local key = App.captureAction
                 if key == "M1" then App.boundPunch = button else App.actionButtons[key] = button end
                 App.captureAction = nil; App.refreshBindings()
+                App.m1Misses, App.lastAction = 0, -math.huge
                 App.notify("Đã gán " .. key, button.Name .. " · dùng nút game, không gửi phím PC.")
                 return
             end
@@ -1816,10 +2042,9 @@ App.cycle(combatPage, "Mục tiêu", {"Chọn thủ công", "Gần nhất"}, fun
     App.releaseAll("combat"); App.goal = nil; App.targetMode, App.current = value, nil
 end)
 App.action(combatPage, "Di chuyển cạnh người đã chọn", App.warpTarget)
-App.toggle(combatPage, "Behind Target Lock (nội suy)", "lock")
+App.action(combatPage, "KHÓA + ĐÁNH + COMBO NGƯỜI ĐÃ CHỌN", function() App.startFarm() end)
 App.slider(combatPage, "Khoảng cách sau lưng", "distance", 3, 10, 0.5)
-App.toggle(combatPage, "Auto M1 (input mô phỏng)", "m1")
-App.toggle(combatPage, "Auto Skill 1–4 (input mô phỏng)", "skills")
+App.toggle(combatPage, "Kèm Skill 1–4 trong Farm", "farmSkills")
 App.slider(combatPage, "Khoảng cách giữa M1 (giây)", "m1Gap", 0.2, 1.5, 0.05)
 App.slider(combatPage, "Khoảng cách giữa phím skill", "skillGap", 0.25, 2, 0.05)
 App.note(combatPage, "Chọn mục tiêu hoặc chế độ Gần nhất. Auto input tự ẩn menu. Mouse API trên PC cần con trỏ ở vùng chơi. Cooldown, damage và kill do máy chủ quyết định.")
@@ -1858,7 +2083,9 @@ local scanAttributes = App.action(combatPage, "Quét thuộc tính thực của 
 end)
 scanAttributes.LayoutOrder, attributes.LayoutOrder = attributes.LayoutOrder, scanAttributes.LayoutOrder
 
-App.note(counterPage, "Chưa có AnimationId mặc định. Chọn đúng ID quan sát được rồi gán Block / Counter / Ultimate. Không bảo đảm phản ứng đúng mọi chiêu hoặc né 100%.")
+App.note(counterPage, "Farm có né thử hoạt ảnh Action gần hướng vào mình và rút khi mất HP. Có thể né nhầm emote hoặc bỏ sót đòn. Để nhận diện chính xác M1 / Counter / Ultimate, gán ID thực bên dưới; không có ID TSB đoán sẵn.")
+App.slider(counterPage, "Tầm né hoạt ảnh gần", "guardRange", 5, 15, 1)
+App.slider(counterPage, "Khoảng rút / né", "guardStep", 6, 20, 1)
 App.toggle(counterPage, "Auto Block theo ID đã gán", "block")
 App.toggle(counterPage, "Dodge Counter theo ID đã gán", "dodge")
 App.toggle(counterPage, "Dodge Ultimate theo ID đã gán", "ultDodge")
@@ -1868,7 +2095,7 @@ App.cycle(counterPage, "Né Ultimate", {"Ra xa", "Sau lưng"}, function() return
 local animationIdBox = App.entry(counterPage, "AnimationId (số hoặc rbxassetid://ID)", "")
 local animationLabel = App.entry(counterPage, "Tên chiêu hiển thị trên ESP", "")
 App.animationKind = "Block"
-App.cycle(counterPage, "Nhóm của ID", {"Block", "Counter", "Ultimate"}, function() return App.animationKind end, function(value) App.animationKind = value end)
+App.cycle(counterPage, "Nhóm của ID", {"M1", "Block", "Counter", "Ultimate"}, function() return App.animationKind end, function(value) App.animationKind = value end)
 local function enteredAnimationId()
     return animationIdBox.Text:match("^%s*(%d+)%s*$") or animationIdBox.Text:match("^%s*rbxassetid://(%d+)%s*$")
 end
@@ -1963,12 +2190,12 @@ App.action(movePage, "Di chuyển về điểm đã lưu", function()
     App.moveTo(App.saved, 100, 5, false)
 end)
 App.action(movePage, "Di chuyển cạnh thùng rác gần nhất", App.warpTrash)
-App.toggle(movePage, "Bật ESP", "esp")
-App.toggle(movePage, "Box ESP", "boxes")
-App.toggle(movePage, "Tracers", "tracers")
-App.toggle(movePage, "Chams Highlight xuyên tường", "chams")
-App.slider(movePage, "Khoảng cách ESP tối đa", "espDistance", 50, 1000, 25)
-App.note(movePage, "Tên chiêu trên ESP lấy từ nhãn AnimationId bạn đã gán. ID chưa gán chỉ hiển thị số, không đoán tên chiêu.")
+App.toggle(optimizePage, "Bật ESP", "esp")
+App.toggle(optimizePage, "Box ESP", "boxes")
+App.toggle(optimizePage, "Tracers", "tracers")
+App.toggle(optimizePage, "Chams Highlight xuyên tường", "chams")
+App.slider(optimizePage, "Khoảng cách ESP tối đa", "espDistance", 50, 1000, 25)
+App.note(optimizePage, "Tên chiêu trên ESP lấy từ nhãn AnimationId bạn đã gán. ID chưa gán chỉ hiển thị số, không đoán tên chiêu.")
 
 App.toggle(optimizePage, "Potato: giảm bóng / vật liệu / effect", "potato")
 App.toggle(optimizePage, "Fullbright cục bộ", "bright")
@@ -2028,7 +2255,7 @@ function App.fit(recenter)
 end
 function App.pauseControls(message)
     local wasActive = App.flags.farm or App.flags.fly or App.flags.speed or App.flags.lock or App.flags.m1 or App.flags.skills or App.flags.block
-    App.releaseAll(); App.goal = nil
+    App.releaseAll(); App.goal = nil; App.pendingAction = nil; App.farmReady = false; App.restore("aim")
     if not App.flags.farm then App.flags.lock, App.flags.m1, App.flags.skills = false, false, false end
     App.flags.block = false
     App.flags.fly, App.flags.speed, App.flags.stabilize = false, false, false
@@ -2171,4 +2398,5 @@ App.bind(Run.Heartbeat, function(dt)
 end)
 watchCamera(); App.updateRoster(); App.refreshBindings(); App.refresh(); App.applyTheme(); App.showMenu(false)
 task.spawn(App.loadWallpaper)
-App.notify("UwUNCTT 2.2 · nctt", "MENU: cài đặt · FARM: chạy · BAY: lên/xuống. Kéo ⋮⋮ để đổi chỗ.")
+App.notify("UwUNCTT 2.3 · Farm " .. App.farmProfile, "FARM: kiểm tra input → khóa → M1 → chiêu. ESP nằm trong ESP / FPS.")
+return App
