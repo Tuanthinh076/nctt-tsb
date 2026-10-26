@@ -1,5 +1,5 @@
 --[[
-UwUNCTT 2.3.1 | Credits: nctt | Hands-off input verification
+UwUNCTT 2.3.2 | Credits: nctt | Fresh input retry and paced verification
 
 PHẠM VI THỰC TẾ
   Đây là menu client tự dựng, không tải UI hay thư viện từ bên ngoài.
@@ -110,7 +110,7 @@ local App = {
     buildProfile = LaunchProfile, farmReady = false, pendingAction = nil, comboCount = 0,
     confirmed = {M1 = 0}, m1Misses = 0, preflightTries = 0, skillRetry = {},
     inputEpoch = 0, lastRealTouch = -math.huge, realTouches = {}, manualCancels = 0,
-    routeStates = {}, routeLog = {}, preflightMatches = 0,
+    routeStates = {}, routeLog = {}, preflightMatches = 0, probeNextAt = 0, touchPayloads = {},
     reactedTracks = setmetatable({}, {__mode = "k"}), guardAt = -math.huge,
     logicAt = 0, groundAt = 0, localAt = 0, espAt = 0, fpsFrames = 0, fpsTime = 0, fps = 0,
     flags = {
@@ -145,6 +145,9 @@ function App.unload()
     disconnect(App.connections)
     for _, watcher in pairs(App.watchers) do disconnect(watcher.connections); disconnect(watcher.character) end
     if App.cameraConnection then App.cameraConnection:Disconnect() end
+    local payloads = {}
+    for _, entry in pairs(App.touchPayloads) do table.insert(payloads, entry) end
+    for _, entry in ipairs(payloads) do pcall(entry.dispose) end
     if App.gui then pcall(function() App.gui:Destroy() end) end
     if App.effects then pcall(function() App.effects:Destroy() end) end
     if Env[RUNTIME_KEY] == App then Env[RUNTIME_KEY] = nil end
@@ -341,6 +344,27 @@ function App.guiHasHandlers(signal)
     end
     return false
 end
+function App.describeHandlers(button)
+    local lines = {}
+    for _, event in ipairs({"Activated", "MouseButton1Click", "InputBegan", "InputEnded", "MouseButton1Down", "MouseButton1Up", "TouchTap"}) do
+        local ok, connections = false, nil
+        if Caps.connections then ok, connections = pcall(Caps.connections, button[event]) end
+        if not ok or type(connections) ~= "table" then
+            table.insert(lines, event .. "=?")
+        else
+            local enabledCount, callableCount = 0, 0
+            for _, connection in ipairs(connections) do
+                local read, enabled, fn = pcall(function() return connection.Enabled, connection.Function end)
+                if read and enabled ~= false then
+                    enabledCount = enabledCount + 1
+                    if type(fn) == "function" then callableCount = callableCount + 1 end
+                end
+            end
+            table.insert(lines, event .. "=" .. tostring(enabledCount) .. "/" .. tostring(callableCount))
+        end
+    end
+    return table.concat(lines, " · ")
+end
 function App.emitGuiAs(method, signal, ...)
     if App.guiHasHandlers(signal) == false then return false end
     if method ~= "Functions" and Caps.signal then
@@ -374,11 +398,13 @@ function App.routeState(key, button)
         or {"Activated", "Click", "Touch", "Nhấn/Thả", "TouchTap"}
     if mode ~= "Tự động" then names = {mode} end
     local events = {Activated = "Activated", Click = "MouseButton1Click", Touch = "InputBegan", ["Nhấn/Thả"] = "MouseButton1Down", TouchTap = "TouchTap"}
-    state = {button = button, mode = mode, choices = {}, index = 1, matches = 0}
+    state = {button = button, mode = mode, choices = {}, index = 1, matches = 0, timeouts = 0}
     for _, name in ipairs(names) do
         local event = events[name]
         if event and App.guiHasHandlers(button[event]) ~= false then
-            if Caps.signal then table.insert(state.choices, {route = name, method = "Signal"}) end
+            -- A physical touch retained after the quiet period is already Ended.
+            -- Only the callback adapter can supply a fresh Begin -> End lifetime.
+            if name ~= "Touch" and Caps.signal then table.insert(state.choices, {route = name, method = "Signal"}) end
             if Caps.connections then table.insert(state.choices, {route = name, method = "Functions"}) end
         end
     end
@@ -390,16 +416,52 @@ function App.routeFailure(key, choice, reason)
     if not state or state.choices[state.index] ~= choice then return end
     table.insert(App.routeLog, key .. " / " .. choice.route .. " / " .. choice.method .. ": " .. tostring(reason))
     while #App.routeLog > 16 do table.remove(App.routeLog, 1) end
-    state.index, state.matches = state.index + 1, 0
+    state.index, state.matches, state.timeouts = state.index + 1, 0, 0
+    if key == "M1" and not App.farmReady then App.preflightMatches = 0 end
     return state.index <= #state.choices
 end
 function App.callbackTouch(button)
-    -- A Lua callback payload, not an engine-created InputObject. Typed handlers may reject it.
-    return {
+    -- Lua callback adapter, not an engine InputObject. No real touch object is modified.
+    -- Game handlers can subscribe to Changed or GetPropertyChangedSignal before release.
+    local events, propertyEvents = {}, {}
+    local function event(name)
+        local object = Instance.new("BindableEvent")
+        object.Name, object.Parent = "UwUNCTT_" .. name, App.gui
+        table.insert(events, object)
+        return object
+    end
+    local changed = event("TouchChanged")
+    local touch = {
         UserInputType = Enum.UserInputType.Touch, UserInputState = Enum.UserInputState.Begin,
         KeyCode = Enum.KeyCode.Unknown, Delta = Vector3.zero,
         Position = Vector3.new(button.AbsolutePosition.X + button.AbsoluteSize.X / 2, button.AbsolutePosition.Y + button.AbsoluteSize.Y / 2, 0),
+        Changed = changed.Event,
     }
+    local ended, disposed = false, false
+    function touch:GetPropertyChangedSignal(property)
+        assert(not disposed, "Touch callback adapter đã dọn")
+        if not propertyEvents[property] then propertyEvents[property] = event("Touch_" .. tostring(property)) end
+        return propertyEvents[property].Event
+    end
+    local entry = {}
+    entry.dispose = function()
+        if disposed then return end
+        disposed = true
+        App.touchPayloads[touch] = nil
+        for _, object in ipairs(events) do object:Destroy() end
+    end
+    App.touchPayloads[touch] = entry
+    local function finish(after)
+        if ended or disposed then return end
+        ended = true
+        touch.UserInputState = Enum.UserInputState.End
+        changed:Fire("UserInputState")
+        if propertyEvents.UserInputState then propertyEvents.UserInputState:Fire() end
+        if after then after(touch) end
+        -- Leave queued handlers a resumption window before removing their signals.
+        entry.cleanupAt = os.clock() + 0.25
+    end
+    return touch, finish
 end
 function App.pressGameButton(key)
     key = key or "M1"
@@ -412,18 +474,15 @@ function App.pressGameButton(key)
         if not choice then App.lastInputError = "Đã thử hết cách gọi nút " .. key .. "; chưa có phản hồi auto."; return nil end
         local route = choice.route
         if App.pendingAction and App.pendingAction.key == key then App.pendingAction.route = choice end
+        App.inputFailures.Callback, App.inputFailures.GUI = nil, nil
         local function emit(signal, ...) return App.emitGuiAs(choice.method, signal, ...) end
         local x, y = button.AbsolutePosition.X + button.AbsoluteSize.X / 2, button.AbsolutePosition.Y + button.AbsoluteSize.Y / 2
         local release, sent
         if route == "Touch" then
-            local touch = choice.method == "Functions" and App.callbackTouch(button) or App.lastTouch
-            if touch then
-                sent = emit(button.InputBegan, touch)
-                release = function()
-                    if choice.method == "Functions" then touch.UserInputState = Enum.UserInputState.End end
-                    emit(button.InputEnded, touch)
-                end
-            end
+            local touch, finish = App.callbackTouch(button)
+            sent = emit(button.InputBegan, touch)
+            release = function() finish(function(payload) emit(button.InputEnded, payload) end) end
+            if not sent then release() end
         elseif route == "Nhấn/Thả" then
             sent = emit(button.MouseButton1Down, x, y)
             release = function() emit(button.MouseButton1Up, x, y) end
@@ -551,6 +610,11 @@ function App.press(key, duration, owner)
     return true
 end
 function App.inputTick(now)
+    local expiredPayloads = {}
+    for _, entry in pairs(App.touchPayloads) do
+        if entry.cleanupAt and now >= entry.cleanupAt then table.insert(expiredPayloads, entry) end
+    end
+    for _, entry in ipairs(expiredPayloads) do entry.dispose() end
     local expired = {}
     for key, held in pairs(App.inputs) do
         if now >= held.untilTime then table.insert(expired, key) end
@@ -824,6 +888,11 @@ function App.confirmAction(source)
         if state and pending.route == state.choices[state.index] then
             state.matches = state.matches + 1; App.preflightMatches = state.matches
         else App.preflightMatches = App.preflightMatches + 1 end
+        if pending.phase == "preflight" then
+            -- A responsive route may still be inside the game's M1 recovery window.
+            App.probeNextAt = os.clock() + 0.7
+            if state then state.timeouts = 0 end
+        end
         if App.preflightMatches >= 2 then App.farmReady = true end
         if pending.phase ~= "preflight" then App.comboCount = App.comboCount + 1 end
     else
@@ -883,6 +952,11 @@ function App.pauseFarm(reason, withdraw)
     App.notify("Farm " .. App.farmProfile .. " tạm dừng", reason)
     App.lastGuiPaint = -math.huge; App.refresh()
 end
+function App.failFarmInput(reason)
+    App.pauseFarm(reason, false)
+    App.inputFailureReport = App.diagnostics()
+    if App.showDiagnostics then App.showDiagnostics(App.inputFailureReport) end
+end
 function App.feedbackTick(now)
     local pending = App.pendingAction
     if pending and pending.observedAt and now - pending.observedAt >= 0.06 then
@@ -893,11 +967,21 @@ function App.feedbackTick(now)
         if pending.key == "M1" then
             App.m1Misses = App.m1Misses + 1
             if not App.farmReady and pending.route then
-                local more = App.routeFailure("M1", pending.route, "Có gọi nút, không có phản hồi độc lập từ auto")
-                App.preflightMatches = 0
-                if not more then App.pauseFarm("Đã thử hết cách gửi M1; auto chưa chạy. Xem / sao chép chẩn đoán.", false) end
+                local state = App.routeStates.M1
+                if state and state.choices[state.index] == pending.route then
+                    state.timeouts = state.timeouts + 1
+                    App.probeNextAt = now + 0.7
+                    if state.timeouts < 3 then
+                        App.farmReport("THỬ LẠI M1 " .. tostring(state.timeouts) .. "/3", "Chưa có phản hồi. Chờ nhịp hồi đòn rồi thử lại tại chỗ; không chạm nút.")
+                    else
+                        local more = App.routeFailure("M1", pending.route, "3 lần gọi nút không có phản hồi độc lập từ auto")
+                        if not more then App.failFarmInput("Đã thử hết cách gửi M1; auto chưa chạy. Lỗi chi tiết ở tab Farm.") end
+                    end
+                end
             elseif App.m1Misses >= 3 then
                 App.pauseFarm("Nút đã được gọi nhưng không thấy nhân vật ra đòn. Gán lại M1; đã ngừng áp sát.", App.farmReady)
+                App.inputFailureReport = App.diagnostics()
+                if App.showDiagnostics then App.showDiagnostics(App.inputFailureReport) end
             end
         elseif pending.route then
             local state = App.routeStates[pending.key]
@@ -918,13 +1002,15 @@ function App.preflightTick(now)
         App.notify("Farm Mobile", "Chạm nút ĐẤM thật của game một lần. Chưa tele khi chưa kiểm tra input.")
         return false
     end
-    if now - App.lastAction < 0.2 then return false end
+    if now < App.probeNextAt or now - App.lastAction < 0.2 then return false end
     local ok, reason, fatal = App.sendCombat("M1", now, "preflight")
     App.preflightTries = App.preflightTries + 1
     if not ok then
         App.lastAction = now
-        if fatal then App.pauseFarm(reason, false)
-        elseif App.preflightTries >= 24 then App.pauseFarm(reason .. " · Đã dừng kiểm tra; xem chẩn đoán.", false)
+        local state = App.routeStates.M1
+        local limit = math.max(24, state and #state.choices * 4 + 2 or 24)
+        if fatal then App.failFarmInput(reason)
+        elseif App.preflightTries >= limit then App.failFarmInput(reason .. " · Đã dừng kiểm tra; lỗi chi tiết ở tab Farm.")
         else App.farmReport("CHỜ NÚT ĐÁNH", reason) end
     else App.farmReport("THỬ AUTO " .. tostring(App.preflightMatches) .. "/2", "Đang tự thử M1 tại chỗ. Không chạm nút đánh / chiêu.") end
     return App.farmReady
@@ -954,13 +1040,17 @@ function App.nextSkill(now)
     end
     return nil
 end
-function App.startFarm(profile)
+function App.startFarm(profile, testOnly)
     profile = profile or App.buildProfile or App.farmProfile
     if profile ~= "PC" and profile ~= "Mobile" then profile = App.isMobile() and "Mobile" or "PC" end
     if App.buildProfile and profile ~= App.buildProfile then return false end
     App.releaseAll(); App.goal = nil; App.stopEmote()
     App.rejected, App.inputFailures, App.lastInputError = {}, {}, ""
-    App.restore("aim"); App.farmProfile = profile; App.counterThreat = nil; App.autoTestOnly = false
+    App.restore("aim"); App.farmProfile = profile; App.counterThreat = nil; App.autoTestOnly = testOnly == true
+    -- A new run must rediscover callbacks; never retain an exhausted route index.
+    App.routeStates, App.routeLog, App.inputFailureReport = {}, {}, nil
+    App.probeNextAt = os.clock() + 0.8
+    if App.diagnosticLabel then App.diagnosticLabel.Visible = false end
     if profile == "PC" then App.m1Mode = "Input" end
     if App.flags.fly then App.flags.fly = false; App.stopFly() end
     if App.targetMode == "Chọn thủ công" and not App.parts(App.selectedPlayer()) then App.targetMode = "Gần nhất" end
@@ -968,8 +1058,6 @@ function App.startFarm(profile)
     App.flags.farm, App.flags.farmPaused = true, false
     App.flags.lock, App.flags.m1, App.flags.skills = true, true, App.flags.farmSkills
     App.farmReady, App.pendingAction, App.comboCount, App.m1Misses, App.preflightTries, App.preflightMatches = false, nil, 0, 0, 0, 0
-    local route = App.routeStates.M1
-    if route then route.matches = 0 end
     App.confirmed, App.skillRetry = {M1 = 0}, {}
     local _, humanoid, root = App.parts(Me)
     App.farmOrigin, App.selfHealth, App.selfHumanoid = root and root.CFrame, humanoid and humanoid.Health, humanoid
@@ -977,7 +1065,8 @@ function App.startFarm(profile)
     App.farmSent, App.farmTargetId, App.farmHealth = 0, nil, nil
     App.farmReport("KIỂM TRA " .. profile, "Kiểm tra M1 trước, sau đó mới khóa và tiếp cận.")
     App.showMenu(false); App.refresh()
-    App.notify("Auto Farm đã bật", "MENU để chỉnh · DỪNG để ngừng. Nút cảm ứng của game được giữ nguyên.")
+    App.notify("Đang kiểm tra Farm " .. profile, "Tự thử M1 tại chỗ trước khi áp sát. Thả tay; MENU / DỪNG để ngừng.")
+    return true
 end
 function App.stopFarm(reason, failed)
     App.flags.farm, App.flags.farmPaused = false, false
@@ -991,7 +1080,7 @@ function App.stopFarm(reason, failed)
 end
 function App.diagnostics()
     local lines = {
-        "UwUNCTT 2.3.1 | Farm " .. App.farmProfile .. " | " .. executor .. (App.isMobile() and " | MOBILE: không gửi phím/chuột PC" or " | PC"),
+        "UwUNCTT 2.3.2 | Farm " .. App.farmProfile .. " | " .. executor .. (App.isMobile() and " | MOBILE: không gửi phím/chuột PC" or " | PC"),
         "Farm: " .. App.farmPhase .. " | " .. App.farmReason,
         "M1: " .. App.m1Mode .. " | backend: " .. App.inputBackend,
         "Đã gửi M1: " .. tostring(App.farmSent),
@@ -1009,9 +1098,10 @@ function App.diagnostics()
         if button then
             local ok, path = pcall(function() return button:GetFullName() end)
             if ok then table.insert(lines, "  " .. path) end
+            if key == "M1" then table.insert(lines, "  Kết nối / hàm gọi được: " .. App.describeHandlers(button)) end
             local state = App.routeStates[key]
             if state then
-                table.insert(lines, "  Cách gọi " .. tostring(state.index) .. "/" .. tostring(#state.choices) .. " | phản hồi: " .. tostring(state.matches))
+                table.insert(lines, "  Cách gọi " .. tostring(state.index) .. "/" .. tostring(#state.choices) .. " | phản hồi: " .. tostring(state.matches) .. " | chưa phản hồi: " .. tostring(state.timeouts))
             end
         end
     end
@@ -1232,7 +1322,9 @@ function App.combatTick(now)
     if App.panel.Visible or App.flags.farmPaused or App.captureAction then
         App.releaseAll("combat")
         if App.goal and App.goal.priority == 10 then App.goal = nil end
-        if App.flags.farm then App.farmReport("TẠM DỪNG", App.panel.Visible and "Thu gọn menu để tiếp tục." or "Bấm TIẾP TỤC FARM.") end
+        if App.flags.farm and not App.flags.farmPaused then
+            App.farmReport("TẠM DỪNG", App.panel.Visible and "Thu gọn menu để tiếp tục." or "Bấm TIẾP TỤC FARM.")
+        end
         return
     end
     if now < App.pauseUntil or App.inputs.F or App.counterActive(now) then
@@ -1910,7 +2002,7 @@ function App.showMenu(visible)
         App.captureAction = nil
         if App.goal and App.goal.priority == 10 then App.goal = nil end
         App.releaseAll(); App.pendingAction = nil; App.restore("aim")
-        if App.flags.farm then App.farmReport("TẠM DỪNG", "Thu gọn menu hoặc bấm TIẾP TỤC để chạy lại.") end
+        if App.flags.farm and not App.flags.farmPaused then App.farmReport("TẠM DỪNG", "Thu gọn menu hoặc bấm TIẾP TỤC để chạy lại.") end
     end
     App.refresh()
     if App.refreshFarmUI then App.refreshFarmUI() end
@@ -2003,20 +2095,32 @@ App.action(homePage, "KIỂM TRA LẠI API INPUT", function()
     Caps.signal, Caps.connections = api("firesignal"), api("getconnections")
     Caps.click, Caps.down, Caps.up = api("mouse1click"), api("mouse1press"), api("mouse1release")
     App.rejected, App.inputFailures, App.lastInputError = {}, {}, ""
+    App.routeStates, App.routeLog, App.preflightMatches, App.probeNextAt = {}, {}, 0, os.clock() + 0.8
+    App.farmReady, App.pendingAction, App.inputFailureReport = false, nil, nil
+    App.releaseAll("combat")
     App.notify("Đã xóa trạng thái lỗi cũ", "Lần gửi M1 tiếp theo sẽ thử lại API. Không bảo đảm executor cấp quyền.")
 end)
 App.diagnosticLabel = App.note(homePage, "CHẨN ĐOÁN: bấm nút bên dưới nếu Farm không đánh được.")
+App.diagnosticLabel.LayoutOrder, App.diagnosticLabel.Visible = -3, false
+function App.showDiagnostics(report)
+    App.diagnosticLabel.Text, App.diagnosticLabel.Visible = report or App.diagnostics(), true
+    for index, page in ipairs(App.pages) do
+        page.Visible = index == 1
+        App.tabs[index].BackgroundColor3 = index == 1 and C.purple or C.row
+    end
+    homePage.CanvasPosition = Vector2.new(0, 0)
+    App.showMenu(true)
+end
 local diagnosticAction = App.action(homePage, "XEM / SAO CHÉP CHẨN ĐOÁN", function()
-    local report = App.diagnostics()
-    App.diagnosticLabel.Text = report
+    local report = App.flags.farmPaused and App.inputFailureReport or App.diagnostics()
+    App.showDiagnostics(report)
     local clipboard = api("setclipboard") or api("toclipboard")
     if clipboard then pcall(clipboard, report); App.notify("Chẩn đoán", "Đã thử sao chép log để bạn gửi khi báo lỗi.") end
 end)
-diagnosticAction.LayoutOrder = -1
+diagnosticAction.LayoutOrder = -4
 local stationaryProbe = App.action(homePage, "THỬ AUTO M1 TẠI CHỖ — THẢ TAY", function()
-    App.routeStates, App.routeLog, App.manualCancels = {}, {}, 0
-    App.startFarm()
-    App.autoTestOnly = true
+    App.manualCancels = 0
+    App.startFarm(nil, true)
 end)
 stationaryProbe.LayoutOrder = -2
 App.note(mobilePage, "Nút điện thoại được giữ nguyên. Nếu auto không nhận đúng nút: bấm GÁN rồi chạm nút thật của game một lần. Không dùng phím 1–4 giả trên mobile.")
@@ -2057,11 +2161,11 @@ function App.handleTouch(input)
     if pending then
         App.pendingAction = nil; App.releaseAll("combat")
         App.manualCancels = App.manualCancels + 1
-        if not App.farmReady then
-            App.preflightMatches = 0
-            local state = App.routeStates.M1
-            if state then state.matches = 0 end
-        end
+    end
+    if not App.farmReady then
+        App.preflightMatches = 0
+        local state = App.routeStates.M1
+        if state then state.matches, state.timeouts = 0, 0 end
     end
     App.lastTouch = input
     local ok, objects = pcall(function() return PlayerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y) end)
@@ -2073,6 +2177,8 @@ function App.handleTouch(input)
             if App.visibleGameButton(button) then
                 local key = App.captureAction
                 if key == "M1" then App.boundPunch = button else App.actionButtons[key] = button end
+                App.routeStates[key], App.inputFailureReport = nil, nil
+                if key == "M1" then App.farmReady, App.preflightMatches, App.probeNextAt = false, 0, os.clock() + 0.8 end
                 App.captureAction = nil; App.refreshBindings()
                 App.m1Misses, App.lastAction = 0, -math.huge
                 App.notify("Đã gán " .. key, button.Name .. " · dùng nút game, không gửi phím PC.")
@@ -2517,5 +2623,6 @@ App.bind(Run.Heartbeat, function(dt)
 end)
 watchCamera(); App.updateRoster(); App.refreshBindings(); App.refresh(); App.applyTheme(); App.showMenu(false)
 task.spawn(App.loadWallpaper)
-App.notify("UwUNCTT 2.3.1 · Farm " .. App.farmProfile, "FARM: thả tay để thử auto tại chỗ. Thao tác tay không tính là auto.")
+App.notify("UwUNCTT 2.3.2 · Farm " .. App.farmProfile, "FARM: thả tay để thử auto tại chỗ. Thao tác tay không tính là auto.")
 return App
+
