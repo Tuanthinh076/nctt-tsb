@@ -1,5 +1,5 @@
 --[[
-UwUNCTT 2.0 | Credits: nctt | Luau client | PC / touch
+UwUNCTT 2.1 | Credits: nctt | Luau client | PC / touch
 
 PHẠM VI THỰC TẾ
   Đây là menu client tự dựng, không tải UI hay thư viện từ bên ngoài.
@@ -12,7 +12,9 @@ PHẠM VI THỰC TẾ
   reset cooldown dash của TSB. Các giới hạn này được ghi trong menu.
 
 THIẾT LẬP COMBAT
-  Chọn người ở tab Combat. Auto M1 / 1–4 chỉ mô phỏng input; server quyết định
+  Tab Farm có nút bắt đầu một lần: tự chọn mục tiêu, tiếp cận và gửi M1.
+  Có thể dùng nút M1 thật của game qua firesignal/getconnections nếu API có.
+  Auto M1 / 1–4 chỉ gửi input hoặc gọi handler nút game; server quyết định
   cooldown, đánh trúng, sát thương và kill. Không tự bỏ qua cooldown server.
   Tab Counter ghi các AnimationId quan sát được: chọn đúng chiêu, gán nhóm
   Block / Counter / Ultimate và tên hiển thị. Danh sách ban đầu RỖNG.
@@ -23,7 +25,7 @@ THIẾT LẬP COMBAT
 ĐIỀU KHIỂN
   RightShift: hiện/ẩn menu. F8 hoặc DỪNG: tắt tính năng, khôi phục thay đổi.
   J: lướt tự tạo nếu đã bật. Fly: WASD / joystick, Space / Ctrl, nút LÊN/XUỐNG.
-  Mở menu tắt Auto M1 / Auto Skill / Auto Block để tránh bấm nhầm giao diện.
+  Mở menu tạm dừng input và bám mục tiêu; thu gọn menu để tiếp tục.
   X gỡ menu, nhả input, dừng animation, ngắt kết nối và hủy đồ họa do menu tạo.
 
 EMOTE / FPS
@@ -72,6 +74,7 @@ local Caps = {
     click = api("mouse1click"), down = api("mouse1press"), up = api("mouse1release"),
     keydown = api("keypress"), keyup = api("keyrelease"),
     fpsset = api("setfpscap"), fpsget = api("getfpscap"), touch = api("firetouchinterest"),
+    signal = api("firesignal"), connections = api("getconnections"),
 }
 local VIM
 pcall(function() VIM = game:GetService("VirtualInputManager") end)
@@ -92,10 +95,15 @@ local App = {
     recent = {}, recentOrder = {}, animations = {}, seenTrack = setmetatable({}, {__mode = "k"}),
     activeSkills = {}, binding = nil, queue = {}, queueIndex = 1, scanVersion = 0,
     pauseUntil = 0, reactionAt = 0, lastAttack = 0, lastSkill = 0, skillIndex = 1,
+    inputBackend = "Chưa gửi M1", lastInputError = "", inputFailures = {},
+    farmPhase = "ĐÃ DỪNG", farmReason = "Bấm BẮT ĐẦU AUTO FARM.", farmSent = 0,
+    farmTargetId = nil, farmHealth = nil, farmDamageAt = 0, lastFollowAt = -math.huge,
+    guiScanAt = -math.huge, m1Mode = "Tự động", teleMode = "Nhanh",
     logicAt = 0, groundAt = 0, localAt = 0, espAt = 0, fpsFrames = 0, fpsTime = 0, fps = 0,
     flags = {
         safe = true, anonymous = false, antiVoid = false, hidden = false,
         lock = false, m1 = false, skills = false, switchAwake = false, missingInactive = false,
+        farm = false, farmSkills = false, farmPaused = false,
         block = false, dodge = false, ultDodge = false, loopEmote = true,
         speed = false, fly = false, dash = false, stabilize = false,
         esp = false, boxes = true, tracers = false, chams = true,
@@ -105,6 +113,7 @@ local App = {
         speed = 28, fly = 48, travel = 85, radius = 18, distance = 4,
         retreat = 30, voidY = -50, m1Gap = 0.36, skillGap = 0.55,
         espDistance = 500, fpsCap = 120, dashLength = 12,
+        targetRange = 500, attackRange = 6.5, teleInterval = 0.3,
     },
     targetMode = "Chọn thủ công", ultMode = "Ra xa", aliasSerial = 0, aliases = {},
 }
@@ -203,6 +212,95 @@ function App.releaseAll(owner)
     end
     for _, key in ipairs(keys) do App.release(key) end
 end
+function App.visibleGameButton(button)
+    if not button or not button.Parent or not button:IsA("GuiButton") then return false end
+    if App.gui and button:IsDescendantOf(App.gui) then return false end
+    if not button:IsDescendantOf(PlayerGui) then return false end
+    local node = button
+    while node and node ~= PlayerGui do
+        if node:IsA("GuiObject") and node.Visible == false then return false end
+        if node:IsA("ScreenGui") and node.Enabled == false then return false end
+        node = node.Parent
+    end
+    return true
+end
+function App.gameButtons()
+    local buttons = {}
+    for _, object in ipairs(PlayerGui:GetDescendants()) do
+        if object:IsA("GuiButton") and App.visibleGameButton(object) then table.insert(buttons, object) end
+    end
+    return buttons
+end
+function App.punchButton()
+    if App.visibleGameButton(App.boundPunch) then return App.boundPunch end
+    if App.visibleGameButton(App.autoPunch) then return App.autoPunch end
+    if os.clock() - App.guiScanAt < 1 then return nil end
+    App.guiScanAt = os.clock()
+    local names = {punch=true,punchbutton=true,attack=true,attackbutton=true,m1=true,m1button=true,basicattack=true}
+    local candidate, count = nil, 0
+    for _, button in ipairs(App.gameButtons()) do
+        local name = string.lower(button.Name):gsub("[^%w]", "")
+        local text = button:IsA("TextButton") and string.lower(button.Text):gsub("%s", "") or ""
+        if names[name] or names[text] then candidate, count = button, count + 1 end
+    end
+    if count == 1 then App.autoPunch = candidate; return candidate end
+    return nil
+end
+function App.guiHasHandlers(signal)
+    if not Caps.connections then return nil end
+    local ok, connections = pcall(Caps.connections, signal)
+    if not ok or type(connections) ~= "table" then return nil end
+    for _, connection in ipairs(connections) do
+        local read, enabled = pcall(function() return connection.Enabled end)
+        if not read or enabled ~= false then return true end
+    end
+    return false
+end
+function App.emitGui(signal, ...)
+    if App.guiHasHandlers(signal) == false then return false end
+    if Caps.signal then
+        local ok, result = pcall(Caps.signal, signal, ...)
+        if ok and result ~= false then return true end
+        if not ok then App.inputFailures.GUI = tostring(result) end
+    end
+    if Caps.connections then
+        local ok, connections = pcall(Caps.connections, signal)
+        if ok and type(connections) == "table" then
+            local called = 0
+            for _, connection in ipairs(connections) do
+                local read, fn, enabled = pcall(function() return connection.Function, connection.Enabled end)
+                if read and enabled ~= false and type(fn) == "function" then
+                    local worked = pcall(fn, ...)
+                    if worked then called = called + 1 end
+                end
+            end
+            if called > 0 then return true end
+        end
+    end
+    return false
+end
+function App.pressGameButton()
+    if not Caps.signal and not Caps.connections then return nil end
+    local button = App.punchButton()
+    if not button then return nil end
+    local activated = App.m1Mode == "GUI Activated"
+    if App.m1Mode == "Tự động" and App.guiHasHandlers(button.MouseButton1Down) == false
+        and App.guiHasHandlers(button.Activated) == true then activated = true end
+    if activated then
+        if App.emitGui(button.Activated, nil, 1) then
+            App.inputBackend = "Nút game: Activated"
+            return function() end
+        end
+    else
+        local x = button.AbsolutePosition.X + button.AbsoluteSize.X / 2
+        local y = button.AbsolutePosition.Y + button.AbsoluteSize.Y / 2
+        if App.emitGui(button.MouseButton1Down, x, y) then
+            App.inputBackend = "Nút game: nhấn/thả"
+            return function() App.emitGui(button.MouseButton1Up, x, y) end
+        end
+    end
+    return nil
+end
 function App.press(key, duration, owner)
     if App.inputs[key] then return true end
     if App.focused == false then return false, "Cửa sổ mất focus", false end
@@ -214,12 +312,23 @@ function App.press(key, duration, owner)
     if key == "M1" then
         local viewport, inset = camera.ViewportSize, GuiService:GetGuiInset()
         local x, y = math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.42 + inset.Y)
-        if VIM and not App.rejected.mouse then
-            local ok = pcall(function() VIM:SendMouseButtonEvent(x, y, 0, true, game, 0) end)
-            if ok then release = function() VIM:SendMouseButtonEvent(x, y, 0, false, game, 0) end
-            else App.rejected.mouse = true end
+        if App.m1Mode ~= "Input" then release = App.pressGameButton() end
+        local inputAllowed = App.m1Mode == "Input" or App.m1Mode == "Tự động"
+        if not release and inputAllowed and VIM and not App.rejected.mouse then
+            local ok, result = pcall(function() VIM:SendMouseButtonEvent(x, y, 0, true, game, 0) end)
+            if ok and result ~= false then
+                release = function() VIM:SendMouseButtonEvent(x, y, 0, false, game, 0) end
+                App.inputBackend = "VirtualInputManager"
+            else App.rejected.mouse = true; App.inputFailures.VIM = tostring(result) end
         end
         if not release then
+            local canClick = inputAllowed and Caps.click and not App.rejected.click
+            local canPair = inputAllowed and Caps.down and Caps.up and not App.rejected.mousePair
+            if not canClick and not canPair then
+                local reason = "Không có input M1 khả dụng. Chọn nút đánh thật của game trong tab Mục tiêu hoặc đổi phương thức M1."
+                App.lastInputError = reason
+                return false, reason, true
+            end
             local pointer = Input:GetMouseLocation()
             if pointer.X < 12 or pointer.X >= viewport.X - 12
                 or pointer.Y < inset.Y + 12 or pointer.Y >= viewport.Y + inset.Y - 12 then
@@ -231,14 +340,15 @@ function App.press(key, duration, owner)
                     if object:IsA("GuiButton") or object:IsA("TextBox") then return false, "Con trỏ trên nút UI", false end
                 end
             end
-            if Caps.click and not App.rejected.click then
-                local clicked = pcall(Caps.click)
-                if clicked then return true else App.rejected.click = true end
+            if canClick then
+                local clicked, result = pcall(Caps.click)
+                if clicked and result ~= false then App.inputBackend = "mouse1click"; return true
+                else App.rejected.click = true; App.inputFailures.click = tostring(result) end
             end
-            if Caps.down and Caps.up and not App.rejected.mousePair then
-                local pressed = pcall(Caps.down)
-                if pressed then release = Caps.up
-                else pcall(Caps.up); App.rejected.mousePair = true end
+            if canPair then
+                local pressed, result = pcall(Caps.down)
+                if pressed and result ~= false then release = Caps.up; App.inputBackend = "mouse1press/release"
+                else pcall(Caps.up); App.rejected.mousePair = true; App.inputFailures.mousePair = tostring(result) end
             end
         end
     else
@@ -256,7 +366,10 @@ function App.press(key, duration, owner)
             else pcall(Caps.keyup, vk); App.rejected.keyPair = true end
         end
     end
-    if not release then return false, "Môi trường chặn hoặc thiếu API mô phỏng input", true end
+    if not release then
+        App.lastInputError = "Môi trường chặn hoặc thiếu API mô phỏng input"
+        return false, App.lastInputError, true
+    end
     App.inputs[key] = {release = release, untilTime = os.clock() + duration, owner = owner}
     return true
 end
@@ -269,6 +382,14 @@ function App.inputTick(now)
 end
 
 -- 03. Local movement. Interpolation is not an anti-cheat bypass.
+function App.rootHeight(character, humanoid, root)
+    local offset = root.Size.Y / 2 + humanoid.HipHeight
+    if humanoid.RigType == Enum.HumanoidRigType.R6 then
+        local leg = character:FindFirstChild("Left Leg") or character:FindFirstChild("Right Leg")
+        if leg and leg:IsA("BasePart") then offset = offset + leg.Size.Y end
+    end
+    return math.max(offset, root.Size.Y / 2) + 0.2
+end
 function App.ground(position)
     local ignore = {}
     for _, player in ipairs(Players:GetPlayers()) do
@@ -278,11 +399,13 @@ function App.ground(position)
     local parameters = RaycastParams.new()
     parameters.FilterType = Enum.RaycastFilterType.Exclude
     parameters.FilterDescendantsInstances = ignore
+    parameters.RespectCanCollide = true
+    parameters.IgnoreWater = true
     local hit = World:Raycast(position + Vector3.new(0, 18, 0), Vector3.new(0, -100, 0), parameters)
     if not hit or hit.Normal.Y < 0.55 then return nil end
-    local _, humanoid, root = App.parts(Me)
+    local character, humanoid, root = App.parts(Me)
     if not humanoid then return nil end
-    return hit.Position + Vector3.new(0, humanoid.HipHeight + root.Size.Y / 2 + 0.3, 0)
+    return hit.Position + Vector3.new(0, App.rootHeight(character, humanoid, root), 0)
 end
 function App.face(position, target)
     local look = Vector3.new(target.X, position.Y, target.Z)
@@ -424,8 +547,17 @@ function App.movementTick(dt, now)
         if not root.Anchored then
             local distance = (goal.cf.Position - root.Position).Magnitude
             local alpha = distance > 0.01 and math.min(1, App.values.travel * math.min(dt, 0.1) / distance) or 1
-            root.CFrame = root.CFrame:Lerp(goal.cf, alpha)
-            root.AssemblyLinearVelocity = Vector3.zero
+            if goal.priority == 10 then
+                local position = root.Position
+                if distance > 0.65 then
+                    position = root.Position + (goal.cf.Position - root.Position) * alpha
+                end
+                local rotation = root.CFrame.Rotation:Lerp(goal.cf.Rotation, 1 - math.exp(-12 * math.min(dt, 0.1)))
+                root.CFrame = CFrame.new(position) * rotation
+            else
+                root.CFrame = root.CFrame:Lerp(goal.cf, alpha)
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
             if distance < 0.3 and goal.priority > 10 then App.goal = nil end
         end
     end
@@ -481,15 +613,59 @@ function App.awake(player)
     end
     return typeof(value) == typeof(binding.value) and value == binding.value
 end
+function App.farmReport(phase, reason, target, distance)
+    App.farmPhase, App.farmReason = phase, reason or ""
+    App.farmDisplayTarget = target
+    App.farmDistance = distance
+    if App.refreshFarmUI then App.refreshFarmUI() end
+end
+function App.startFarm()
+    App.releaseAll(); App.goal = nil; App.stopEmote()
+    if App.flags.fly then App.flags.fly = false; App.stopFly() end
+    if App.targetMode == "Chọn thủ công" and not App.parts(App.selectedPlayer()) then App.targetMode = "Gần nhất" end
+    App.current = App.targetMode == "Chọn thủ công" and App.selected or nil
+    App.flags.farm, App.flags.farmPaused = true, false
+    App.flags.lock, App.flags.m1, App.flags.skills = true, true, App.flags.farmSkills
+    App.lastAttack, App.lastSkill, App.lastFollowAt = -math.huge, -math.huge, -math.huge
+    App.farmSent, App.farmTargetId, App.farmHealth = 0, nil, nil
+    App.farmReport("ĐANG TÌM", "Tự chọn mục tiêu và tiếp cận.")
+    App.showMenu(false); App.refresh()
+    App.notify("Auto Farm đã bật", "UwU mở cài đặt và tạm dừng. F8 / DỪNG để dừng hoàn toàn.")
+end
+function App.stopFarm(reason, failed)
+    App.flags.farm, App.flags.farmPaused = false, false
+    App.flags.lock, App.flags.m1, App.flags.skills = false, false, false
+    App.releaseAll("combat")
+    if App.goal and App.goal.priority == 10 then App.goal = nil end
+    App.current = nil
+    App.farmReport(failed and "INPUT KHÔNG KHẢ DỤNG" or "ĐÃ DỪNG", reason or "Bấm BẮT ĐẦU AUTO FARM.")
+    App.refresh()
+    if failed then App.showMenu(true); App.notify("Farm đã dừng", reason) end
+end
+function App.diagnostics()
+    local lines = {
+        "UwUNCTT 2.1 | " .. executor,
+        "Farm: " .. App.farmPhase .. " | " .. App.farmReason,
+        "M1: " .. App.m1Mode .. " | backend: " .. App.inputBackend,
+        "Đã gửi M1: " .. tostring(App.farmSent),
+        "VIM bị chặn: " .. tostring(App.rejected.mouse == true),
+        "firesignal: " .. tostring(Caps.signal ~= nil) .. " | getconnections: " .. tostring(Caps.connections ~= nil),
+        "mouse1click: " .. tostring(Caps.click ~= nil),
+        "Nút M1: " .. ((App.boundPunch or App.autoPunch) and (App.boundPunch or App.autoPunch).Name or "Chưa gán / chưa tìm thấy"),
+        "Lỗi input: " .. App.lastInputError,
+    }
+    for key, value in pairs(App.inputFailures) do table.insert(lines, key .. ": " .. tostring(value):sub(1, 180)) end
+    return table.concat(lines, "\n")
+end
 function App.nearest(exclude, requireInactive)
     local _, _, myRoot = App.parts(Me)
     if not myRoot then return nil end
-    local best, distance = nil, 1000
+    local best, distance = nil, App.values.targetRange
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= Me and player.UserId ~= exclude then
             local _, _, root = App.parts(player)
             local eligible = not requireInactive or App.awake(player) == false
-            if root and eligible then
+            if root and eligible and root.Position.Y > App.values.voidY + 5 then
                 local d = (root.Position - myRoot.Position).Magnitude
                 if d < distance then best, distance = player, d end
             end
@@ -499,12 +675,18 @@ function App.nearest(exclude, requireInactive)
 end
 function App.chooseTarget()
     local target
-    if App.targetMode == "Gần nhất" then target = App.nearest(nil, App.flags.switchAwake)
+    if App.targetMode == "Gần nhất" then
+        local current = App.current and Players:GetPlayerByUserId(App.current)
+        local _, _, currentRoot = App.parts(current)
+        local _, _, myRoot = App.parts(Me)
+        local inRange = currentRoot and myRoot and (currentRoot.Position - myRoot.Position).Magnitude <= App.values.targetRange
+        if inRange and currentRoot.Position.Y > App.values.voidY + 5 then target = current
+        else target = App.nearest(nil, App.flags.switchAwake) end
     else
         target = App.current and Players:GetPlayerByUserId(App.current) or App.selectedPlayer()
         if not App.parts(target) and App.current ~= App.selected then target = App.selectedPlayer() end
     end
-    if not target or not App.parts(target) then return nil end
+    if not target or not App.parts(target) then App.current = nil; return nil end
     if App.flags.switchAwake then
         local awakened = App.awake(target)
         if awakened ~= false then
@@ -519,6 +701,42 @@ function App.chooseTarget()
     end
     App.current = target and target.UserId or nil
     return target
+end
+function App.followTarget(target, now)
+    if now - App.lastFollowAt < 0.09 and target.UserId == App.followTargetId then return App.followOkay end
+    App.lastFollowAt = now
+    App.followTargetId = target.UserId
+    local _, humanoid, myRoot = App.parts(Me)
+    local _, _, root = App.parts(target)
+    if not root or not myRoot or myRoot.Anchored or humanoid.PlatformStand then
+        App.followOkay = false
+        if App.goal and App.goal.priority == 10 then App.goal = nil end
+        return false
+    end
+    local ground = App.ground((root.CFrame * CFrame.new(0, 0, App.values.distance)).Position)
+    if not ground then
+        App.followOkay = false
+        if App.goal and App.goal.priority == 10 then App.goal = nil end
+        return false
+    end
+    local destination = App.face(ground, root.Position)
+    local delta = (destination.Position - myRoot.Position).Magnitude
+    local mayJump = now - (App.lastWarpAt or -math.huge) >= App.values.teleInterval
+    if App.teleMode == "Nhanh" and delta > 12 and mayJump then
+        if App.moveTo(destination, 10, 0, true) then App.lastWarpAt = now end
+    else App.moveTo(destination, 10, 0.45, false) end
+    App.followOkay = true
+    return true
+end
+function App.followTick(now)
+    if not (App.flags.lock or App.flags.farm) or App.flags.fly or App.panel.Visible
+        or App.flags.farmPaused or now < App.pauseUntil or App.focused == false then return end
+    local target = App.chooseTarget()
+    if not target then
+        if App.goal and App.goal.priority == 10 then App.goal = nil end
+        return
+    end
+    App.followTarget(target, now)
 end
 function App.react(player, track, id, now)
     local rule = App.animations[id]
@@ -620,25 +838,65 @@ function App.reactionTick(now)
     end
 end
 function App.combatTick(now)
-    if App.panel.Visible or now < App.pauseUntil or App.inputs.F then return end
-    if not (App.flags.lock or App.flags.m1 or App.flags.skills) then return end
-    local _, _, myRoot = App.parts(Me)
-    local target = App.chooseTarget()
-    local _, _, root = App.parts(target)
-    if not myRoot or not root then
+    if not (App.flags.farm or App.flags.lock or App.flags.m1 or App.flags.skills) then return end
+    if App.panel.Visible or App.flags.farmPaused then
         App.releaseAll("combat")
         if App.goal and App.goal.priority == 10 then App.goal = nil end
+        if App.flags.farm then App.farmReport("TẠM DỪNG", App.panel.Visible and "Thu gọn menu để tiếp tục." or "Bấm TIẾP TỤC FARM.") end
+        return
+    end
+    if now < App.pauseUntil or App.inputs.F then
+        if App.flags.farm then App.farmReport("ĐANG NÉ / BLOCK", "Tạm ngừng gửi đòn đánh.") end
+        return
+    end
+    local _, humanoid, myRoot = App.parts(Me)
+    if not myRoot then
+        App.releaseAll("combat"); App.current = nil
+        if App.goal and App.goal.priority == 10 then App.goal = nil end
+        if App.flags.farm then App.farmReport("CHỜ HỒI SINH", "Nhân vật chưa sẵn sàng; sẽ tìm mục tiêu sau khi hồi sinh.") end
+        return
+    end
+    if myRoot.Anchored or humanoid.PlatformStand then
+        App.releaseAll("combat")
+        if App.goal and App.goal.priority == 10 then App.goal = nil end
+        if App.flags.farm then App.farmReport("CHỜ NHÂN VẬT", "Nhân vật đang bị neo hoặc khống chế.") end
+        return
+    end
+    local target = App.chooseTarget()
+    local _, targetHumanoid, root = App.parts(target)
+    if not root then
+        App.releaseAll("combat")
+        if App.goal and App.goal.priority == 10 then App.goal = nil end
+        if App.flags.farm then App.farmReport("CHỜ MỤC TIÊU", "Chưa có mục tiêu còn sống trong phạm vi / cờ nộ phù hợp.") end
         return
     end
     if App.flags.lock and not App.flags.fly then
-        local ground = App.ground((root.CFrame * CFrame.new(0, 0, App.values.distance)).Position)
-        if ground then App.moveTo(App.face(ground, root.Position), 10, 0.5, false) end
+        if not App.followTarget(target, now) then
+            if App.flags.farm then App.farmReport("CHỜ MẶT ĐẤT", "Không tìm được vị trí đứng sau mục tiêu.", target) end
+            return
+        end
     end
-    if (root.Position - myRoot.Position).Magnitude > 7 then return end
+    local distance = (root.Position - myRoot.Position).Magnitude
+    if distance > App.values.attackRange then
+        if App.flags.farm then App.farmReport("ĐANG TIẾP CẬN", "Chờ vào tầm đánh.", target, distance) end
+        return
+    end
+    if App.farmTargetId ~= target.UserId then
+        App.farmTargetId, App.farmHealth, App.farmDamageAt = target.UserId, targetHumanoid.Health, now
+    elseif targetHumanoid.Health < (App.farmHealth or targetHumanoid.Health) then App.farmDamageAt = now end
+    App.farmHealth = targetHumanoid.Health
+    if App.flags.farm then
+        local reason = now - App.farmDamageAt > 7 and "Đã gửi M1 nhưng chưa thấy HP giảm; kiểm tra phương thức / trạng thái game." or "Đang gửi M1 trong tầm. Server quyết định damage và kill."
+        App.farmReport("TRONG TẦM ĐÁNH", reason, target, distance)
+    end
     if App.flags.m1 and now - App.lastAttack >= math.max(App.values.m1Gap, App.flags.safe and 0.65 or 0.18) then
         App.lastAttack = now
         local ok, reason, fatal = App.press("M1", 0.045, "combat")
-        if not ok and fatal then App.flags.m1 = false; App.refresh(); App.notify("Auto M1 đã tắt", reason) end
+        if ok then App.farmSent = App.farmSent + 1; if App.refreshFarmUI then App.refreshFarmUI() end
+        elseif fatal then
+            if App.flags.farm then App.stopFarm(reason, true); return
+            else App.flags.m1 = false; App.refresh(); App.notify("Auto M1 đã tắt", reason) end
+        elseif App.flags.farm then App.farmReport("CHỜ INPUT", reason, target, distance) end
     end
     if App.flags.skills and now - App.lastSkill >= math.max(App.values.skillGap, App.flags.safe and 1.1 or 0.25) then
         App.lastSkill = now
@@ -791,12 +1049,15 @@ end
 
 -- 07. Feature lifecycle, manual actions, complete custom UI library.
 function App.stopCombat()
+    App.flags.farm, App.flags.farmPaused = false, false
     App.flags.m1, App.flags.skills, App.flags.block, App.flags.lock = false, false, false, false
     App.releaseAll(); App.goal = nil
+    App.farmReport("ĐÃ DỪNG", "Thao tác điều khiển khác đã dừng Farm.")
     App.refresh()
 end
 function App.setFlag(key, enabled)
     if not App.alive then return end
+    if not enabled and App.flags.farm and (key == "m1" or key == "lock") then App.stopFarm(); return end
     if key == "switchAwake" and enabled and not App.binding then
         App.notify("Chưa có cờ nộ", "Quét thuộc tính của mục tiêu rồi chọn đúng trạng thái đang nộ."); return
     end
@@ -840,6 +1101,8 @@ function App.setFlag(key, enabled)
         end
     end
     App.flags[key] = enabled
+    if key == "farmSkills" and App.flags.farm then App.flags.skills = enabled end
+    if key == "skills" and App.flags.farm then App.flags.farmSkills = enabled end
     if key == "potato" or key == "fragments" then App.queueScan()
     elseif key == "bright" then App.refreshLighting()
     elseif key == "esp" and not enabled then App.clearESP()
@@ -861,6 +1124,7 @@ function App.stopAll(message)
     for _, name in ipairs(groups) do App.restore(name) end
     if App.originalCap ~= nil and Caps.fpsset then pcall(Caps.fpsset, App.originalCap); App.originalCap = nil end
     App.clearESP(); App.refresh()
+    App.farmReport("ĐÃ DỪNG", "Đã tắt điều khiển và nhả input.")
     if message then App.notify("DỪNG", message) end
 end
 function App.warpTarget()
@@ -931,51 +1195,54 @@ if not pcall(function() App.gui.Parent = host end) then App.gui.Parent = PlayerG
 App.overlay = App.new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 1}, App.gui)
 App.effects = App.new("Folder", {Name = "UwUNCTT_LocalVisuals"}, World)
 App.panel = App.new("Frame", {
-    Size = UDim2.fromOffset(440, 580), AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(660, 680), AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = C.bg,
     BorderSizePixel = 0, Active = true, ZIndex = 10,
 }, App.gui)
 App.round(App.panel, 14)
 local border = App.new("UIStroke", {Thickness = 1.4, Color = C.purple, Transparency = 0.2}, App.panel)
 App.new("UIGradient", {Color = ColorSequence.new(C.red, C.purple), Rotation = 35}, border)
-local header = App.new("Frame", {Size = UDim2.new(1, 0, 0, 66), BackgroundTransparency = 1, Active = true}, App.panel)
+local header = App.new("Frame", {Size = UDim2.new(1, 0, 0, 74), BackgroundTransparency = 1, Active = true}, App.panel)
 App.new("TextLabel", {
-    Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -190, 0, 27),
+    Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -192, 0, 29),
     BackgroundTransparency = 1, Text = "UwUNCTT", TextColor3 = C.red,
     Font = Enum.Font.GothamBold, TextSize = 22, TextXAlignment = Enum.TextXAlignment.Left,
 }, header)
 App.new("TextLabel", {
-    Position = UDim2.fromOffset(17, 37), Size = UDim2.new(1, -32, 0, 18),
-    BackgroundTransparency = 1, Text = "nctt  /  v2.0  /  " .. executor,
-    Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Left,
+    Position = UDim2.fromOffset(17, 49), Size = UDim2.new(1, -32, 0, 18),
+    BackgroundTransparency = 1, Text = "nctt  /  v2.1  /  " .. executor,
+    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Left,
 }, header)
 local function headerButton(text, x, width, color)
     local button = App.new("TextButton", {
-        Position = UDim2.new(1, x, 0, 14), Size = UDim2.fromOffset(width, 30),
+        Position = UDim2.new(1, x, 0, 7), Size = UDim2.fromOffset(width, 44),
         BackgroundColor3 = color or C.row, BorderSizePixel = 0,
-        Text = text, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 12,
+        Text = text, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 14,
     }, header)
     App.round(button, 7); return button
 end
-local emergency = headerButton("DỪNG", -160, 68, C.red)
-local minimize, close = headerButton("—", -84, 32), headerButton("X", -44, 32)
-local tabBar = App.new("ScrollingFrame", {
-    Position = UDim2.fromOffset(12, 69), Size = UDim2.new(1, -24, 0, 39),
-    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 2,
-    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.X,
-    ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarImageColor3 = C.purple,
+local emergency = headerButton("DỪNG", -184, 80, C.red)
+App.emergencyButton = emergency
+local minimize, close = headerButton("—", -96, 40), headerButton("X", -48, 40)
+local tabBar = App.new("Frame", {
+    Position = UDim2.fromOffset(12, 79), Size = UDim2.new(1, -24, 0, 98),
+    BackgroundTransparency = 1, BorderSizePixel = 0,
 }, App.panel)
-App.new("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, tabBar)
+App.tabBar = tabBar
+App.navGrid = App.new("UIGridLayout", {
+    CellSize = UDim2.new(0.25, -5, 0, 46), CellPadding = UDim2.fromOffset(6, 6),
+    FillDirection = Enum.FillDirection.Horizontal, FillDirectionMaxCells = 4, SortOrder = Enum.SortOrder.LayoutOrder,
+}, tabBar)
 App.pages, App.tabs = {}, {}
-for index, title in ipairs({"Bảo vệ", "Nhân vật", "Combat", "Counter", "Emote", "Di chuyển", "Tối ưu"}) do
+for index, title in ipairs({"Farm", "Mục tiêu", "Di chuyển", "ESP / FPS", "Counter", "Nhân vật", "Emote", "Cài đặt"}) do
     local button = App.new("TextButton", {
-        Size = UDim2.fromOffset(100, 33), BackgroundColor3 = index == 1 and C.purple or C.row,
-        BorderSizePixel = 0, Text = title, TextColor3 = C.text,
-        Font = Enum.Font.GothamMedium, TextSize = 12, LayoutOrder = index,
+        Size = UDim2.fromOffset(100, 46), BackgroundColor3 = index == 1 and C.purple or C.row,
+        BorderSizePixel = 0, Text = title, TextColor3 = C.text, TextWrapped = true,
+        Font = Enum.Font.GothamMedium, TextSize = 14, LayoutOrder = index,
     }, tabBar)
     App.round(button, 8)
     local page = App.new("ScrollingFrame", {
-        Position = UDim2.fromOffset(12, 119), Size = UDim2.new(1, -24, 1, -169),
+        Position = UDim2.fromOffset(12, 189), Size = UDim2.new(1, -24, 1, -245),
         BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
         CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
         ScrollBarImageColor3 = C.purple, Visible = index == 1,
@@ -993,8 +1260,8 @@ for index, title in ipairs({"Bảo vệ", "Nhân vật", "Combat", "Counter", "E
 end
 App.status = App.new("TextLabel", {
     Position = UDim2.new(0, 16, 1, -41), Size = UDim2.new(1, -32, 0, 30),
-    BackgroundTransparency = 1, Text = "Tất cả tính năng đang tắt · F8: dừng · RightShift: menu",
-    Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.muted, TextWrapped = true,
+    BackgroundTransparency = 1, Text = "F6: Farm  ·  F7: tạm dừng  ·  F8: dừng hết",
+    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.muted, TextWrapped = true,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, App.panel)
 App.toasts = {}
@@ -1031,9 +1298,9 @@ local function nextOrder(parent)
 end
 function App.note(parent, text)
     local label = App.new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 42), AutomaticSize = Enum.AutomaticSize.Y,
+        Size = UDim2.new(1, 0, 0, 48), AutomaticSize = Enum.AutomaticSize.Y,
         BackgroundColor3 = C.card, BorderSizePixel = 0, Text = text, TextWrapped = true,
-        Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.muted,
+        Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = C.muted,
         TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
         LayoutOrder = nextOrder(parent),
     }, parent)
@@ -1042,8 +1309,8 @@ function App.note(parent, text)
 end
 function App.action(parent, text, callback)
     local button = App.new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = C.row, BorderSizePixel = 0,
-        Text = text, TextWrapped = true, TextColor3 = C.text, TextSize = 12,
+        Size = UDim2.new(1, 0, 0, 56), BackgroundColor3 = C.row, BorderSizePixel = 0,
+        Text = text, TextWrapped = true, TextColor3 = C.text, TextSize = 14,
         Font = Enum.Font.GothamMedium, LayoutOrder = nextOrder(parent),
     }, parent)
     App.round(button)
@@ -1059,23 +1326,24 @@ function App.toggle(parent, text, key)
     table.insert(App.refreshers, refresh); refresh(); return button
 end
 function App.entry(parent, title, initial)
-    local frame = App.new("Frame", {Size = UDim2.new(1, 0, 0, 68), BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = nextOrder(parent)}, parent)
+    local frame = App.new("Frame", {Size = UDim2.new(1, 0, 0, 82), BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = nextOrder(parent)}, parent)
     App.round(frame)
-    App.new("TextLabel", {Position = UDim2.fromOffset(10, 4), Size = UDim2.new(1, -20, 0, 20), BackgroundTransparency = 1, Text = title, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Left}, frame)
-    local box = App.new("TextBox", {Position = UDim2.fromOffset(9, 28), Size = UDim2.new(1, -18, 0, 32), BackgroundColor3 = C.row, BorderSizePixel = 0, ClearTextOnFocus = false, Text = initial or "", Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.text}, frame)
+    App.new("TextLabel", {Position = UDim2.fromOffset(10, 5), Size = UDim2.new(1, -20, 0, 23), BackgroundTransparency = 1, Text = title, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Left}, frame)
+    local box = App.new("TextBox", {Position = UDim2.fromOffset(9, 33), Size = UDim2.new(1, -18, 0, 40), BackgroundColor3 = C.row, BorderSizePixel = 0, ClearTextOnFocus = false, Text = initial or "", Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = C.text}, frame)
     App.round(box, 6); return box
 end
 function App.slider(parent, title, key, low, high, step, callback)
-    local frame = App.new("Frame", {Size = UDim2.new(1, 0, 0, 68), BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = nextOrder(parent)}, parent)
+    local frame = App.new("Frame", {Size = UDim2.new(1, 0, 0, 84), BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = nextOrder(parent)}, parent)
     App.round(frame)
-    App.new("TextLabel", {Position = UDim2.fromOffset(11, 6), Size = UDim2.new(1, -92, 0, 23), BackgroundTransparency = 1, Text = title, TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left}, frame)
-    local box = App.new("TextBox", {Position = UDim2.new(1, -76, 0, 5), Size = UDim2.fromOffset(64, 26), BackgroundColor3 = C.row, BorderSizePixel = 0, ClearTextOnFocus = false, Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = C.red}, frame)
+    App.new("TextLabel", {Position = UDim2.fromOffset(11, 7), Size = UDim2.new(1, -105, 0, 28), BackgroundTransparency = 1, Text = title, TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left}, frame)
+    local box = App.new("TextBox", {Position = UDim2.new(1, -90, 0, 5), Size = UDim2.fromOffset(78, 36), BackgroundColor3 = C.row, BorderSizePixel = 0, ClearTextOnFocus = false, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = C.red}, frame)
     App.round(box, 6)
-    local bar = App.new("Frame", {Position = UDim2.new(0, 13, 0, 46), Size = UDim2.new(1, -26, 0, 8), BackgroundColor3 = C.row, BorderSizePixel = 0, Active = true}, frame)
+    local hit = App.new("Frame", {Position = UDim2.new(0, 13, 0, 45), Size = UDim2.new(1, -26, 0, 34), BackgroundTransparency = 1, Active = true}, frame)
+    local bar = App.new("Frame", {Position = UDim2.fromOffset(0, 12), Size = UDim2.new(1, 0, 0, 10), BackgroundColor3 = C.row, BorderSizePixel = 0, Active = true}, hit)
     App.round(bar, 4)
     local fill = App.new("Frame", {Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.purple, BorderSizePixel = 0}, bar)
     App.round(fill, 4)
-    local thumb = App.new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(17, 17), Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = C.red, BorderSizePixel = 0, Active = true}, bar)
+    local thumb = App.new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(24, 24), Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = C.red, BorderSizePixel = 0, Active = true}, bar)
     App.round(thumb, 9)
     local function paint()
         local alpha = (App.values[key] - low) / (high - low)
@@ -1098,7 +1366,7 @@ function App.slider(parent, title, key, low, high, step, callback)
             App.sliderDrag = {input = input, update = fromX}; fromX(input.Position.X)
         end
     end
-    bar.InputBegan:Connect(began); thumb.InputBegan:Connect(began)
+    hit.InputBegan:Connect(began); bar.InputBegan:Connect(began); thumb.InputBegan:Connect(began)
     box.FocusLost:Connect(function() set(tonumber(box.Text)) end)
     table.insert(App.refreshers, paint); paint()
 end
@@ -1122,9 +1390,17 @@ function App.emptyList(parent)
     orderMap[parent] = 0
 end
 
-local floating = App.new("TextButton", {Position = UDim2.new(0, 10, 0.4, 0), Size = UDim2.fromOffset(65, 39), BackgroundColor3 = C.purple, BorderSizePixel = 0, Text = "UwU", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 15, Visible = false, ZIndex = 20}, App.gui)
-local floatingStop = App.new("TextButton", {Position = UDim2.new(0, 10, 0.4, 46), Size = UDim2.fromOffset(65, 34), BackgroundColor3 = C.red, BorderSizePixel = 0, Text = "DỪNG", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 11, Visible = false, ZIndex = 20}, App.gui)
-App.round(floating); App.round(floatingStop)
+local floating = App.new("TextButton", {Position = UDim2.new(0, 10, 0.38, 0), Size = UDim2.fromOffset(80, 44), BackgroundColor3 = C.purple, BorderSizePixel = 0, Text = "UwU", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 16, Visible = false, ZIndex = 20}, App.gui)
+local floatingStop = App.new("TextButton", {Position = UDim2.new(0, 10, 0.38, 52), Size = UDim2.fromOffset(80, 44), BackgroundColor3 = C.red, BorderSizePixel = 0, Text = "DỪNG HẾT", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 12, Visible = false, ZIndex = 20}, App.gui)
+local floatingFarm = App.new("TextButton", {Position = UDim2.new(0, 10, 0.38, 104), Size = UDim2.fromOffset(80, 56), BackgroundColor3 = C.row, BorderSizePixel = 0, Text = "CHẠY\nFARM", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 13, Visible = false, ZIndex = 20}, App.gui)
+App.round(floating); App.round(floatingStop); App.round(floatingFarm)
+App.farmBadge = App.new("TextLabel", {
+    AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 46),
+    Size = UDim2.fromOffset(330, 64), BackgroundColor3 = C.card, BorderSizePixel = 0,
+    Text = "", TextWrapped = true, TextColor3 = C.text, Font = Enum.Font.GothamMedium,
+    TextSize = 13, Visible = false, ZIndex = 19,
+}, App.gui)
+App.round(App.farmBadge)
 App.flightHud = App.new("Frame", {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.45, 0), Size = UDim2.fromOffset(62, 150), BackgroundTransparency = 1, Visible = false, ZIndex = 20}, App.gui)
 for index, title in ipairs({"LÊN", "XUỐNG", "LƯỚT"}) do
     local button = App.new("TextButton", {Position = UDim2.fromOffset(0, (index - 1) * 50), Size = UDim2.fromOffset(62, 42), BackgroundColor3 = C.row, BorderSizePixel = 0, Text = title, TextColor3 = C.text, TextSize = 11, Font = Enum.Font.GothamBold}, App.flightHud)
@@ -1141,25 +1417,97 @@ for index, title in ipairs({"LÊN", "XUỐNG", "LƯỚT"}) do
 end
 function App.showMenu(visible)
     App.panel.Visible = visible
-    floating.Visible, floatingStop.Visible = not visible, not visible
+    floating.Visible, floatingStop.Visible, floatingFarm.Visible = not visible, not visible, not visible
     App.flightHud.Visible = not visible and (App.flags.fly or App.flags.dash)
     if visible then
         if App.goal and App.goal.priority == 10 then App.goal = nil end
-        local active = App.flags.m1 or App.flags.skills or App.flags.block
-        App.flags.m1, App.flags.skills, App.flags.block = false, false, false
         App.releaseAll()
-        if active then App.notify("Mở menu", "Đã tắt input tự động để tránh bấm nhầm.") end
+        if App.flags.farm then App.farmReport("TẠM DỪNG", "Thu gọn menu hoặc bấm TIẾP TỤC để chạy lại.") end
     end
     App.refresh()
+    if App.refreshFarmUI then App.refreshFarmUI() end
 end
 table.insert(App.refreshers, function() App.flightHud.Visible = not App.panel.Visible and (App.flags.fly or App.flags.dash) end)
+floatingFarm.Activated:Connect(function() if App.flags.farm then App.stopFarm() else App.startFarm() end end)
 floating.Activated:Connect(function() App.showMenu(true) end)
 floatingStop.Activated:Connect(function() App.stopAll("Đã tắt và khôi phục thay đổi."); App.showMenu(true) end)
 emergency.Activated:Connect(function() App.stopAll("Đã tắt và khôi phục thay đổi.") end)
 minimize.Activated:Connect(function() App.showMenu(false) end)
 close.Activated:Connect(App.unload)
 
-local protect, characterPage, combatPage, counterPage, emotePage, movePage, optimizePage = table.unpack(App.pages)
+local homePage = App.pages[1]
+local combatPage, movePage, optimizePage = App.pages[2], App.pages[3], App.pages[4]
+local counterPage, characterPage, emotePage, protect = App.pages[5], App.pages[6], App.pages[7], App.pages[8]
+App.primaryFarm = App.action(homePage, "BẮT ĐẦU AUTO FARM", function()
+    if App.flags.farm then App.stopFarm() else App.startFarm() end
+end)
+App.primaryFarm.Size, App.primaryFarm.TextSize = UDim2.new(1, 0, 0, 68), 17
+App.resumeFarm = App.action(homePage, "TIẾP TỤC • THU GỌN MENU", function()
+    if not App.flags.farm then App.startFarm()
+    else App.flags.farmPaused = false; App.showMenu(false); App.refresh() end
+end)
+App.farmStatusLabel = App.note(homePage, "Bấm BẮT ĐẦU AUTO FARM. Mặc định tự chọn người gần nhất nếu chưa chọn ai.")
+App.farmStatusLabel.TextColor3, App.farmStatusLabel.Size = C.text, UDim2.new(1, 0, 0, 110)
+function App.refreshFarmUI()
+    if not App.alive then return end
+    local target = App.farmDisplayTarget
+    local targetText = target and App.name(target) or "—"
+    local distance = App.farmDistance and string.format(" · %.1f studs", App.farmDistance) or ""
+    App.primaryFarm.Text = App.flags.farm and "DỪNG AUTO FARM" or "BẮT ĐẦU AUTO FARM"
+    App.primaryFarm.BackgroundColor3 = App.flags.farm and C.red or C.purple
+    App.resumeFarm.Text = App.flags.farm and "TIẾP TỤC • THU GỌN MENU" or "BẮT ĐẦU VỚI CÀI ĐẶT HIỆN TẠI"
+    App.farmStatusLabel.Text = App.farmPhase .. "\n" .. App.farmReason .. "\nMục tiêu: " .. targetText .. distance .. "\nM1 đã gửi: " .. tostring(App.farmSent) .. " · " .. App.inputBackend
+    floatingFarm.Text = App.flags.farm and "DỪNG\nFARM" or "CHẠY\nFARM"
+    floatingFarm.BackgroundColor3 = App.flags.farm and C.red or C.row
+    App.farmBadge.Visible = App.flags.farm and not App.panel.Visible
+    App.farmBadge.Text = "FARM · " .. App.farmPhase .. "\n" .. targetText .. distance .. "\n" .. App.inputBackend
+end
+table.insert(App.refreshers, App.refreshFarmUI)
+App.note(homePage, "Một nút để chọn mục tiêu, tiếp cận và M1. Mở menu chỉ tạm dừng; thu gọn để tiếp tục. Không tự nhận là có kill chỉ vì API đã nhận thao tác.")
+App.cycle(homePage, "Chọn mục tiêu", {"Gần nhất", "Chọn thủ công"}, function() return App.targetMode end, function(value)
+    App.releaseAll("combat"); App.goal = nil; App.current = nil; App.targetMode = value
+end)
+App.cycle(homePage, "Auto tele", {"Nhanh", "Êm"}, function() return App.teleMode end, function(value)
+    App.teleMode = value; App.lastFollowAt = -math.huge
+end)
+App.cycle(homePage, "Cách gửi M1", {"Tự động", "Input", "GUI Nhấn/Thả", "GUI Activated"}, function() return App.m1Mode end, function(value)
+    App.releaseAll("combat"); App.m1Mode = value; App.rejected = {}; App.lastInputError = ""
+    App.inputBackend = "Chưa gửi M1"; App.refreshFarmUI()
+end)
+App.toggle(homePage, "Kèm Skill 1–4 khi Farm", "farmSkills")
+App.slider(homePage, "Phạm vi tìm mục tiêu", "targetRange", 50, 1000, 25)
+App.slider(homePage, "Khoảng đứng sau lưng", "distance", 3, 8, 0.5)
+App.slider(homePage, "Tầm bắt đầu M1", "attackRange", 4, 8, 0.5)
+App.slider(homePage, "Khoảng nghỉ giữa tele xa", "teleInterval", 0.15, 1, 0.05)
+local gameButtonList = App.list(homePage)
+local scanGameButtons = App.action(homePage, "CHỌN NÚT ĐÁNH THẬT CỦA GAME", function()
+    App.emptyList(gameButtonList)
+    local buttons = App.gameButtons()
+    table.sort(buttons, function(a, b) return a.Name < b.Name end)
+    for index, button in ipairs(buttons) do
+        if index > 50 then break end
+        local candidate = button
+        App.action(gameButtonList, (button.Parent and button.Parent.Name or "") .. " / " .. button.Name, function()
+            App.boundPunch = candidate; App.rejected.mouse = nil
+            App.notify("Đã chọn nút M1", "Chỉ chọn nút đánh thường, không chọn nút nhảy hoặc skill. Thử GUI Nhấn/Thả hoặc GUI Activated.")
+        end)
+    end
+    if #buttons == 0 then App.note(gameButtonList, "Không có nút game đang hiển thị. Trên PC, dùng Input nếu executor hỗ trợ.") end
+end)
+scanGameButtons.LayoutOrder, gameButtonList.LayoutOrder = gameButtonList.LayoutOrder, scanGameButtons.LayoutOrder
+App.action(homePage, "KIỂM TRA LẠI API INPUT", function()
+    Caps.signal, Caps.connections = api("firesignal"), api("getconnections")
+    Caps.click, Caps.down, Caps.up = api("mouse1click"), api("mouse1press"), api("mouse1release")
+    App.rejected, App.inputFailures, App.lastInputError = {}, {}, ""
+    App.notify("Đã xóa trạng thái lỗi cũ", "Lần gửi M1 tiếp theo sẽ thử lại API. Không bảo đảm executor cấp quyền.")
+end)
+App.diagnosticLabel = App.note(homePage, "CHẨN ĐOÁN: bấm nút bên dưới nếu Farm không đánh được.")
+App.action(homePage, "XEM / SAO CHÉP CHẨN ĐOÁN", function()
+    local report = App.diagnostics()
+    App.diagnosticLabel.Text = report
+    local clipboard = api("setclipboard") or api("toclipboard")
+    if clipboard then pcall(clipboard, report); App.notify("Chẩn đoán", "Đã thử sao chép log để bạn gửi khi báo lỗi.") end
+end)
 App.note(protect, "UwUNCTT · nctt\nMenu client độc lập. Nhận diện API không đồng nghĩa đã kiểm chứng mọi executor. Không có anti-ban tuyệt đối.")
 App.toggle(protect, "Safe Mode: chỉ giảm tần suất", "safe")
 App.toggle(protect, "Anonymizer: tên giả trong menu / ESP", "anonymous")
@@ -1167,7 +1515,7 @@ App.slider(protect, "Tốc độ nội suy (studs/giây)", "travel", 20, 200, 5)
 App.note(protect, "Nội suy không phải Teleport Bypass. pcall chỉ bắt lỗi Lua; không chặn lệnh kick hoặc phát hiện từ máy chủ. Anonymizer chỉ đổi hình ảnh phía bạn.")
 App.action(protect, "Xem API đã nhận diện", function()
     local lines = {"Executor: " .. executor, "getgenv: " .. tostring(type(getgenv) == "function"), "gethui: " .. tostring(Caps.gethui ~= nil), "VirtualInputManager: " .. tostring(VIM ~= nil)}
-    for _, name in ipairs({"click", "down", "up", "keydown", "keyup", "fpsset", "fpsget", "touch"}) do
+    for _, name in ipairs({"click", "down", "up", "keydown", "keyup", "signal", "connections", "fpsset", "fpsget", "touch"}) do
         table.insert(lines, name .. ": " .. tostring(Caps[name] ~= nil))
     end
     local synAvailable = false
@@ -1202,7 +1550,7 @@ function App.updateRoster()
         if player ~= Me and (filter == "" or string.find(string.lower(display), filter, 1, true)) then
             local candidate = player
             local button = App.action(roster, display, function()
-                App.stopCombat(); App.selected, App.current = candidate.UserId, nil
+                App.releaseAll("combat"); App.goal = nil; App.selected, App.current = candidate.UserId, nil
                 App.targetMode = "Chọn thủ công"; App.awakeNotice = nil
                 App.updateRoster(); App.refresh()
             end)
@@ -1214,7 +1562,7 @@ function App.updateRoster()
 end
 search:GetPropertyChangedSignal("Text"):Connect(App.updateRoster)
 App.cycle(combatPage, "Mục tiêu", {"Chọn thủ công", "Gần nhất"}, function() return App.targetMode end, function(value)
-    App.stopCombat(); App.targetMode, App.current = value, nil
+    App.releaseAll("combat"); App.goal = nil; App.targetMode, App.current = value, nil
 end)
 App.action(combatPage, "Di chuyển cạnh người đã chọn", App.warpTarget)
 App.toggle(combatPage, "Behind Target Lock (nội suy)", "lock")
@@ -1395,9 +1743,23 @@ function App.fit(recenter)
     if not camera then return end
     local viewport = camera.ViewportSize
     local top, bottom = GuiService:GetGuiInset()
-    local width = math.max(220, math.min(480, viewport.X - 18))
-    local height = math.max(240, math.min(620, viewport.Y - top.Y - bottom.Y - 18))
+    local wide = viewport.X >= 800
+    local width = math.max(260, math.min(wide and 680 or 480, viewport.X - 18))
+    local availableHeight = viewport.Y - top.Y - bottom.Y - 18
+    local height = math.max(240, math.min(690, availableHeight))
     App.panel.Size = UDim2.fromOffset(width, height)
+    local columns = wide and 8 or 4
+    local navigationHeight = wide and 46 or 98
+    App.navGrid.FillDirectionMaxCells = columns
+    App.navGrid.CellSize = UDim2.new(1 / columns, -6, 0, 46)
+    App.tabBar.Size = UDim2.new(1, -24, 0, navigationHeight)
+    local pageTop = 79 + navigationHeight + 12
+    for _, page in ipairs(App.pages) do
+        page.Position = UDim2.fromOffset(12, pageTop)
+        page.Size = UDim2.new(1, -24, 1, -pageTop - 56)
+    end
+    App.farmBadge.Size = UDim2.fromOffset(math.min(340, viewport.X - 24), 64)
+    App.farmBadge.Position = UDim2.new(0.5, 0, 0, top.Y + 10)
     local wantedX = recenter and viewport.X / 2 or App.panel.Position.X.Scale * viewport.X + App.panel.Position.X.Offset
     local wantedY = recenter and (viewport.Y + top.Y - bottom.Y) / 2 or App.panel.Position.Y.Scale * viewport.Y + App.panel.Position.Y.Offset
     local x = math.clamp(wantedX, width / 2 + 6, math.max(width / 2 + 6, viewport.X - width / 2 - 6))
@@ -1405,19 +1767,22 @@ function App.fit(recenter)
     App.panel.Position = UDim2.fromOffset(x, y)
 end
 function App.pauseControls(message)
-    local wasActive = App.flags.fly or App.flags.speed or App.flags.lock or App.flags.m1 or App.flags.skills or App.flags.block
-    App.stopCombat()
+    local wasActive = App.flags.farm or App.flags.fly or App.flags.speed or App.flags.lock or App.flags.m1 or App.flags.skills or App.flags.block
+    App.releaseAll(); App.goal = nil
+    if not App.flags.farm then App.flags.lock, App.flags.m1, App.flags.skills = false, false, false end
+    App.flags.block = false
     App.flags.fly, App.flags.speed, App.flags.stabilize = false, false, false
     App.stopFly(); App.restore("speed"); App.restore("stabilize"); App.stopEmote()
     App.keys, App.upPointer, App.downPointer = {}, nil, nil
     App.refresh()
+    if App.flags.farm then App.farmReport("TẠM DỪNG", message or "Chờ nhân vật sẵn sàng để tiếp tục.") end
     if wasActive and message then App.notify("Tạm dừng điều khiển", message) end
 end
 App.focused = true
 local drag
 header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-        if input.Position.X > header.AbsolutePosition.X + header.AbsoluteSize.X - 174 then return end
+        if input.Position.X > header.AbsolutePosition.X + header.AbsoluteSize.X - 192 then return end
         drag = {input = input, start = input.Position, position = App.panel.Position}
     end
 end)
@@ -1440,6 +1805,16 @@ end)
 App.bind(Input.InputBegan, function(input, processed)
     if Input:GetFocusedTextBox() then return end
     if input.KeyCode == Enum.KeyCode.F8 then App.stopAll("Đã dừng và khôi phục."); App.showMenu(true); return end
+    if not processed and input.KeyCode == Enum.KeyCode.F6 then
+        if App.flags.farm then App.stopFarm() else App.startFarm() end
+        return
+    end
+    if not processed and input.KeyCode == Enum.KeyCode.F7 and App.flags.farm then
+        App.flags.farmPaused = not App.flags.farmPaused
+        App.releaseAll("combat"); App.goal = nil
+        App.farmReport(App.flags.farmPaused and "TẠM DỪNG" or "ĐANG TÌM", App.flags.farmPaused and "F7 hoặc nút TIẾP TỤC để chạy lại." or "Đang tiếp tục Farm.")
+        return
+    end
     if not processed and input.KeyCode == Enum.KeyCode.RightShift then App.showMenu(not App.panel.Visible); return end
     if not processed then
         App.keys[input.KeyCode] = true
@@ -1451,6 +1826,8 @@ App.bind(Input.WindowFocused, function() App.focused = true end)
 App.bind(Me.CharacterRemoving, function()
     App.pauseControls()
     App.lastGround, App.current, App.hiddenParts = nil, nil, {}
+    App.farmTargetId, App.farmHealth = nil, nil
+    if App.flags.farm then App.farmReport("CHỜ HỒI SINH", "Farm vẫn bật, chờ nhân vật mới.") end
     App.restore("hidden"); App.restore("anonymous")
 end)
 App.bind(Players.PlayerAdded, function(player) App.watch(player); App.updateRoster() end)
@@ -1503,17 +1880,23 @@ App.bind(Run.Heartbeat, function(dt)
     local suspended = not App.focused or GuiService.MenuIsOpen
     if suspended and not App.suspended then App.pauseControls("Đang dùng menu Roblox hoặc mất focus.") end
     App.suspended = suspended
-    if not suspended then App.try("Di chuyển client", App.movementTick, dt, now) end
+    if not suspended then
+        local followOk, followError = App.try("Bám mục tiêu", App.followTick, now)
+        if not followOk and App.flags.farm then App.stopFarm("Lỗi bám mục tiêu: " .. tostring(followError):sub(1, 140), true) end
+        local moveOk, moveError = App.try("Di chuyển client", App.movementTick, dt, now)
+        if not moveOk and App.flags.farm then App.stopFarm("Lỗi di chuyển: " .. tostring(moveError):sub(1, 140), true) end
+    end
     if now - App.logicAt >= (App.flags.safe and 0.22 or 0.10) then
         App.logicAt = now
         if not suspended then
             App.try("Counter / Block", App.reactionTick, now)
-            App.try("Combat", App.combatTick, now)
+            local combatOk, combatError = App.try("Combat", App.combatTick, now)
+            if not combatOk and App.flags.farm then App.stopFarm("Lỗi combat: " .. tostring(combatError):sub(1, 140), true) end
         end
         local target = App.current and Players:GetPlayerByUserId(App.current)
-        App.status.Text = string.format("%d FPS  ·  %s  ·  F8: DỪNG", App.fps, target and App.name(target) or "Chưa có mục tiêu tự động")
+        App.status.Text = string.format("%d FPS  ·  %s  ·  F8: DỪNG", App.fps, App.flags.farm and App.farmPhase or (target and App.name(target) or "F6: Farm"))
     end
     App.try("Tối ưu đồ họa", App.workQueue)
 end)
 watchCamera(); App.updateRoster(); App.refresh()
-App.notify("UwUNCTT · nctt", "Đã mở menu. Tính năng tự động chưa bật. Xem giới hạn trong tab Bảo vệ.")
+App.notify("UwUNCTT 2.1 · nctt", "Tab Farm: bấm BẮT ĐẦU. UwU mở cài đặt, F8 dừng hết.")
