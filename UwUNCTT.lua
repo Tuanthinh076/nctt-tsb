@@ -1,5 +1,5 @@
 --[[
-UwUNCTT 2.3.3 | Credits: nctt | Combat interruption and bounded recovery
+UwUNCTT 2.4 | Credits: nctt | Live emote catalog, counter signals, native skill tools
 
 PHẠM VI THỰC TẾ
   Đây là menu client tự dựng, không tải UI hay thư viện từ bên ngoài.
@@ -17,8 +17,10 @@ THIẾT LẬP COMBAT
   Trên điện thoại KHÔNG gửi chuột/phím PC: giữ nguyên HUD cảm ứng của game.
   Auto M1 / 1–4 chỉ gửi input hoặc gọi handler nút game; server quyết định
   cooldown, đánh trúng, sát thương và kill. Không tự bỏ qua cooldown server.
-  Tab Counter ghi các AnimationId quan sát được: chọn đúng chiêu, gán nhóm
-  Block / Counter / Ultimate và tên hiển thị. Danh sách ban đầu RỖNG.
+  Chiêu ưu tiên Tool thật khớp tên hotbar / thuộc tính Slot; không đoán thứ tự Tool.
+  Counter đọc dấu Counter dạng boolean / Folder có trong client, không cần nhập ID.
+  Tín hiệu không được game gửi xuống thì chưa nhận diện được; không bảo đảm né hết.
+  Quy tắc hoạt ảnh theo ID vẫn có trong mục nâng cao, không phải bước bắt buộc.
   Tab Combat đọc thuộc tính thực của Player/Character. Để mục tiêu bật nộ rồi
   chọn cờ thể hiện trạng thái ĐANG nộ, không chọn chỉ số thanh tích nộ.
   Dữ liệu thiếu mặc định được coi là chưa rõ; không đoán tên thuộc tính TSB.
@@ -30,6 +32,8 @@ THIẾT LẬP COMBAT
   X gỡ menu, nhả input, dừng animation, ngắt kết nối và hủy đồ họa do menu tạo.
 
 EMOTE / FPS
+  Danh sách emote đọc Animation có sẵn trong ReplicatedStorage.Animations.Emotes.
+  Người dùng chọn tên, không cần tìm ID. Dữ liệu chưa có thì danh sách để trống.
   AnimationId phải có quyền sử dụng và đúng rig. Không mở quyền emote trả phí.
   FPS cap chỉ bật nếu đọc được cap gốc và có API đặt cap để có thể khôi phục.
   Không gọi GC cưỡng bức định kỳ hoặc xóa bừa Parts của map.
@@ -42,7 +46,7 @@ API references:
 ]]
 
 -- 01. Services, capability detection, runtime ownership.
-local VERSION = "2.3.3"
+local VERSION = "2.4"
 local LaunchProfile = ...
 if LaunchProfile ~= "PC" and LaunchProfile ~= "Mobile" then LaunchProfile = nil end
 local Players = game:GetService("Players")
@@ -52,6 +56,8 @@ local GuiService = game:GetService("GuiService")
 local Tween = game:GetService("TweenService")
 local World = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
+local Replicated
+pcall(function() Replicated = game:GetService("ReplicatedStorage") end)
 local Me = Players.LocalPlayer
 assert(Me, "UwUNCTT phải chạy ở phía client.")
 local PlayerGui = Me:WaitForChild("PlayerGui", 15)
@@ -114,13 +120,15 @@ local App = {
     routeStates = {}, routeLog = {}, preflightMatches = 0, probeNextAt = 0, touchPayloads = {},
     attempts = {}, interruptedActions = 0, combatQuietUntil = 0, selfAction = nil,
     recoveryCount = 0, recoveryWindow = -math.huge, recovering = false,
+    toolSlots = {}, toolScanAt = -math.huge, actionBackends = {}, emoteCatalog = {},
+    counterScanAt = -math.huge, counterHolds = 0, counterStatus = "Chưa thấy dấu Counter ở gần.",
     reactedTracks = setmetatable({}, {__mode = "k"}), guardAt = -math.huge,
     logicAt = 0, groundAt = 0, localAt = 0, espAt = 0, fpsFrames = 0, fpsTime = 0, fps = 0,
     flags = {
         safe = false, anonymous = false, antiVoid = false, hidden = false,
         lock = false, m1 = false, skills = false, switchAwake = false, missingInactive = false,
         farm = false, farmSkills = true, farmPaused = false,
-        farmGuard = true, farmAim = true, unknownGuard = false,
+        farmGuard = true, farmAim = true, unknownGuard = false, counterSignals = true,
         block = false, dodge = false, ultDodge = false, loopEmote = true,
         speed = false, fly = false, dash = false, stabilize = false,
         esp = false, boxes = true, tracers = false, chams = true,
@@ -326,6 +334,87 @@ function App.actionButton(key)
     if best and not tied then App.autoButtons[key] = best; return best end
     return nil
 end
+local function toolLabel(text)
+    return string.lower(tostring(text or "")):gsub("’", ""):gsub("[^%w]", "")
+end
+function App.skillTool(key)
+    if not skillSlots[key] then return nil end
+    local backpack, character = Me:FindFirstChild("Backpack"), Me.Character
+    if not backpack or not character then return nil end
+    if os.clock() - App.toolScanAt >= 0.7 then
+        App.toolScanAt, App.toolSlots = os.clock(), {}
+        local tools, labels = {}, {}
+        for _, container in ipairs({backpack, character}) do
+            for _, object in ipairs(container:GetChildren()) do
+                if object:IsA("Tool") then table.insert(tools, object) end
+            end
+        end
+        local hud = PlayerGui:FindFirstChild("Hotbar")
+        local pack = hud and hud:FindFirstChild("Backpack")
+        local bar = pack and pack:FindFirstChild("Hotbar")
+        for action, slot in pairs(skillSlots) do
+            local scope = (bar and bar:FindFirstChild(slot)) or App.actionButton(action)
+            local names = {}; labels[action] = names
+            if scope then
+                local objects = scope:GetDescendants(); table.insert(objects, scope)
+                for _, object in ipairs(objects) do
+                    if object:IsA("TextLabel") or object:IsA("TextButton") then
+                        local name = toolLabel(object.Text)
+                        if #name > 1 then names[name] = true end
+                    end
+                end
+            end
+        end
+        for action, slot in pairs(skillSlots) do
+            local best, rank, tied = nil, 0, false
+            for _, object in ipairs(tools) do
+                local score = labels[action][toolLabel(object.Name)] and 3 or 0
+                local value = object:GetAttribute("Slot")
+                if (type(value) == "number" or type(value) == "string") and tostring(value) == slot then score = math.max(score, 2) end
+                if score > rank then best, rank, tied = object, score, false
+                elseif score > 0 and score == rank then tied = true end
+            end
+            if best and not tied then App.toolSlots[action] = best end
+        end
+    end
+    local tool = App.toolSlots[key]
+    if tool and (tool.Parent == backpack or tool.Parent == character) then return tool end
+    return nil
+end
+function App.pressSkillTool(key)
+    local tool = App.skillTool(key)
+    if not tool then return nil end
+    if tool.Enabled == false then return nil, "Chiêu đang bị vô hiệu / hồi: " .. tool.Name end
+    if tool.RequiresHandle and not tool:FindFirstChild("Handle") then return nil, "Tool thiếu Handle: " .. tool.Name end
+    local character, humanoid = App.parts(Me)
+    local backpack = Me:FindFirstChild("Backpack")
+    if not humanoid or not backpack then return nil end
+    local previous, epoch = nil, App.inputEpoch
+    for _, object in ipairs(character:GetChildren()) do if object:IsA("Tool") and object ~= tool then previous = object; break end end
+    local released = false
+    local function release()
+        if released then return end
+        released = true
+        pcall(function() tool:Deactivate() end)
+        -- Restore only our selection; a later physical input/selection takes precedence.
+        if epoch ~= App.inputEpoch or Me.Character ~= character or tool.Parent ~= character then return end
+        for _, object in ipairs(character:GetChildren()) do if object:IsA("Tool") and object ~= tool then return end end
+        pcall(function() humanoid:UnequipTools() end)
+        if previous and previous.Parent == backpack then pcall(function() humanoid:EquipTool(previous) end) end
+    end
+    local ok, reason = pcall(function()
+        humanoid:EquipTool(tool)
+        assert(tool.Parent == character, "Tool chưa được trang bị")
+        tool:Activate()
+    end)
+    if not ok then
+        release(); App.inputFailures.Tool = tostring(reason):sub(1, 180)
+        return nil
+    end
+    App.inputBackend = "Tool · " .. key .. " · " .. tool.Name
+    App.actionBackends[key] = App.inputBackend
+    return release
+end
 function App.hasGameHandler(button)
     if not Caps.connections then return nil end
     local unknown = false
@@ -525,6 +614,14 @@ function App.press(key, duration, owner)
     if App.captureAction then return false, "Đang gán nút cảm ứng", false end
     if Input:GetFocusedTextBox() or GuiService.MenuIsOpen then return false, "Đang dùng giao diện", false end
     if owner == "combat" and os.clock() < App.manualUntil then return false, "Ưu tiên thao tác tay", false end
+    if skillSlots[key] then
+        local release, reason = App.pressSkillTool(key)
+        if release then
+            App.inputs[key] = {release=release, untilTime=os.clock() + duration, owner=owner}
+            App.lastInputError = ""
+            return true
+        elseif reason then return false, reason, false end
+    end
     if App.isMobile() then
         local button = App.actionButton(key)
         if not button then
@@ -812,6 +909,26 @@ function App.movementTick(dt, now)
 end
 
 -- 04. Animation playback. Asset permissions remain enforced by Roblox.
+function App.scanEmotes()
+    local animations = Replicated and Replicated:FindFirstChild("Animations")
+    local folder = animations and animations:FindFirstChild("Emotes")
+    local catalog, seen = {}, {}
+    if folder then
+        for _, object in ipairs(folder:GetDescendants()) do
+            if #catalog >= 1000 then break end
+            if object:IsA("Animation") then
+                local id = tostring(object.AnimationId):match("%d+")
+                if id and id ~= "0" and not seen[id] then
+                    seen[id] = true
+                    table.insert(catalog, {id=id, name=object.Name, object=object})
+                end
+            end
+        end
+    end
+    table.sort(catalog, function(a, b) return string.lower(a.name) < string.lower(b.name) end)
+    App.emoteCatalog, App.emoteSourceFolder = catalog, folder
+    return catalog
+end
 function App.stopEmote()
     if App.emote then
         pcall(function() App.emote.track:Stop(0.1); App.emote.track:Destroy() end)
@@ -819,7 +936,7 @@ function App.stopEmote()
         App.emote = nil
     end
 end
-function App.playEmote(id)
+function App.playEmote(id, name)
     local _, humanoid = App.parts(Me)
     local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
     if not animator then App.notify("Emote", "Animator chưa sẵn sàng."); return end
@@ -841,7 +958,7 @@ function App.playEmote(id)
         return
     end
     App.emote = {asset = asset, track = track}
-    App.notify("Emote", "Đã gửi yêu cầu phát ID " .. id .. "; quyền asset và rig vẫn áp dụng.")
+    App.notify("Emote", "Đã yêu cầu phát " .. tostring(name or ("ID " .. id)) .. "; quyền asset và rig vẫn áp dụng.")
 end
 
 -- 05. Observed game data, configurable combat, animation reactions.
@@ -1098,8 +1215,9 @@ function App.nextSkill(now)
     for offset = 0, 3 do
         local index = (App.skillIndex - 1 + offset) % 4 + 1
         local key = keys[index]
-        local button = App.isMobile() and App.actionButton(key) or nil
-        if now >= (App.skillRetry[key] or 0) and (not App.isMobile() or (button and not App.buttonCooling(button))) then
+        local button, tool = App.actionButton(key), App.skillTool(key)
+        local ready = (not button or not App.buttonCooling(button)) and ((tool and tool.Enabled ~= false) or (App.isMobile() and button) or not App.isMobile())
+        if now >= (App.skillRetry[key] or 0) and ready then
             App.skillIndex = index % 4 + 1; return key
         end
     end
@@ -1115,6 +1233,7 @@ function App.startFarm(profile, testOnly)
     -- A new run must rediscover callbacks; never retain an exhausted route index.
     App.routeStates, App.routeLog, App.inputFailureReport = {}, {}, nil
     App.attempts, App.interruptedActions, App.combatQuietUntil, App.selfAction = {}, 0, 0, nil
+    App.toolSlots, App.toolScanAt, App.actionBackends, App.counterHolds = {}, -math.huge, {}, 0
     App.recoveryCount, App.recoveryWindow, App.recovering, App.lastInterruption = 0, -math.huge, false, nil
     App.probeNextAt = os.clock() + 0.8
     if App.diagnosticLabel then App.diagnosticLabel.Visible = false end
@@ -1157,6 +1276,7 @@ function App.diagnostics()
         "Chiêu 1–4: " .. tostring(App.flags.farmSkills) .. " | né hoạt ảnh chưa gán: " .. tostring(App.flags.unknownGuard),
         "Đòn bị ngắt: " .. tostring(App.interruptedActions) .. " | kiểm tra lại M1: " .. tostring(App.recoveryCount) .. "/3",
         "Lý do ngắt: " .. tostring(App.lastInterruption or "Chưa có"),
+        "Counter: " .. App.counterStatus .. " | lần tránh: " .. tostring(App.counterHolds),
         "VIM bị chặn: " .. tostring(App.rejected.mouse == true),
         "firesignal: " .. tostring(Caps.signal ~= nil) .. " | getconnections: " .. tostring(Caps.connections ~= nil),
         "mouse1click: " .. tostring(Caps.click ~= nil),
@@ -1167,6 +1287,10 @@ function App.diagnostics()
         local button = App.actionButton(key)
         table.insert(lines, key .. ": " .. (button and button.Name or "Chưa gán") .. " / " .. (App.buttonModes[key] or "Tự động")
             .. " | gửi " .. tostring(App.attempts[key] or 0) .. " / hoạt ảnh " .. tostring(App.confirmed[key] or 0))
+        if skillSlots[key] then
+            local tool = App.skillTool(key)
+            table.insert(lines, "  Tool: " .. (tool and tool.Name or "Chưa khớp slot") .. " | " .. (App.actionBackends[key] or "Chưa dùng Tool"))
+        end
         if button then
             local ok, path = pcall(function() return button:GetFullName() end)
             if ok then table.insert(lines, "  " .. path) end
@@ -1254,8 +1378,62 @@ function App.followTarget(target, now)
 end
 function App.counterActive(now)
     local threat = App.counterThreat
-    if threat and threat.track.IsPlaying and now < threat.expires then return true end
+    if threat and threat.signal then
+        local player = Players:GetPlayerByUserId(threat.playerId)
+        local character = player and App.parts(player)
+        if character == threat.character and App.counterIndicator(threat.character) then return true end
+    elseif threat and threat.track and threat.track.IsPlaying and now < threat.expires then return true end
     App.counterThreat = nil; return false
+end
+function App.counterIndicator(character)
+    if not character or not character.Parent then return nil end
+    if character:GetAttribute("Counter") == true then return character, "Counter=true" end
+    local marker = character:FindFirstChild("Counter")
+    if not marker then return nil end
+    if marker:IsA("BoolValue") then
+        if marker.Value == true then return marker, "Counter (BoolValue=true)" end
+    elseif marker:IsA("Folder") or marker:IsA("Configuration") then
+        return marker, "Counter (dấu hiện diện)"
+    end
+    -- An equipped tool or a numeric counter/cooldown is not proof of an active counter.
+    return nil
+end
+function App.reportCounter(message)
+    if App.counterStatus == message then return end
+    App.counterStatus = message
+    if App.counterStatusLabel then App.counterStatusLabel.Text = message end
+end
+function App.counterSignalTick(now)
+    local enabled = App.flags.dodge or (App.flags.farm and not App.flags.farmPaused and App.flags.farmGuard)
+    if not App.flags.counterSignals or not enabled then
+        if App.counterThreat and App.counterThreat.signal then App.counterThreat = nil end
+        return
+    end
+    if App.panel.Visible or App.focused == false or Input:GetFocusedTextBox() or GuiService.MenuIsOpen then return end
+    if App.counterActive(now) then return end
+    local _, humanoid, mine = App.parts(Me)
+    if not mine or App.actorBlocked(humanoid, mine) then return end
+    local target, distance, source = nil, App.values.radius, nil
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= Me then
+            local character, _, root = App.parts(player)
+            local marker, label = App.counterIndicator(character)
+            local d = root and (root.Position - mine.Position).Magnitude
+            if marker and d and d <= distance then target, distance, source = player, d, label end
+        end
+    end
+    if not target then App.reportCounter("Chưa thấy dấu Counter đang bật ở gần."); return end
+    local character, _, root = App.parts(target)
+    App.counterThreat = {signal=true, playerId=target.UserId, character=character}
+    App.counterHolds = App.counterHolds + 1
+    App.reportCounter("Đang tránh " .. App.name(target) .. " · " .. source)
+    App.interruptCombat(now, "Dấu Counter trong client: " .. source, 0.45)
+    local away = mine.Position - root.Position
+    away = Vector3.new(away.X, 0, away.Z)
+    if away.Magnitude < 0.1 then away = root.CFrame.RightVector end
+    local floor = App.ground(mine.Position + away.Unit * App.values.retreat)
+    if floor then App.moveTo(App.face(floor, root.Position), 240, 0.7, App.teleMode == "Nhanh") end
+    App.farmReport("TRÁNH DẤU COUNTER", "Ngừng đánh / bám đến khi dấu Counter biến mất; không cần ID.", target, distance)
 end
 function App.followTick(now)
     if not (App.flags.lock or App.flags.farm) or App.flags.fly or App.panel.Visible
@@ -1445,7 +1623,10 @@ function App.combatTick(now)
         return
     end
     if now < App.pauseUntil or App.inputs.F or App.counterActive(now) then
-        if App.flags.farm then App.farmReport("ĐANG NÉ / BLOCK", "Tạm ngừng gửi đòn đánh.") end
+        if App.flags.farm then
+            if App.counterThreat and App.counterThreat.signal then App.farmReport("TRÁNH DẤU COUNTER", App.counterStatus)
+            else App.farmReport("ĐANG NÉ / BLOCK", "Tạm ngừng gửi đòn đánh.") end
+        end
         return
     end
     if App.flags.farm and not App.preflightTick(now) then return end
@@ -1668,7 +1849,7 @@ function App.setFlag(key, enabled)
     if key == "switchAwake" and enabled and not App.binding then
         App.notify("Chưa có cờ nộ", "Quét thuộc tính của mục tiêu rồi chọn đúng trạng thái đang nộ."); return
     end
-    local needed = ({block = "Block", dodge = "Counter", ultDodge = "Ultimate"})[key]
+    local needed = ({block = "Block", ultDodge = "Ultimate"})[key]
     if needed and enabled then
         local found = false
         for _, rule in pairs(App.animations) do if rule.kind == needed then found = true end end
@@ -1721,7 +1902,7 @@ function App.setFlag(key, enabled)
     App.notify(enabled and "Đã bật" or "Đã tắt", key == "safe" and "Chỉ giảm tần suất; không có bảo đảm chống ban." or key)
 end
 function App.stopAll(message)
-    local preferences = {safe = true, loopEmote = true, farmSkills = true, farmAim = true, farmGuard = true, unknownGuard = true,
+    local preferences = {safe = true, loopEmote = true, farmSkills = true, farmAim = true, farmGuard = true, unknownGuard = true, counterSignals = true,
         boxes = true, tracers = true, chams = true}
     for key, value in pairs(App.flags) do
         if type(value) == "boolean" and not preferences[key] then App.flags[key] = false end
@@ -1883,7 +2064,7 @@ App.navGrid = App.new("UIGridLayout", {
     FillDirection = Enum.FillDirection.Horizontal, FillDirectionMaxCells = 4, SortOrder = Enum.SortOrder.LayoutOrder,
 }, tabBar)
 App.pages, App.tabs = {}, {}
-for index, title in ipairs({"Farm", "Mục tiêu", "Bay / Đi", "ESP / FPS", "Counter", "Nhân vật", "Nút MB", "Cài đặt"}) do
+for index, title in ipairs({"Farm", "Mục tiêu", "Bay / Đi", "ESP / FPS", "Counter", "Emote / NV", "Nút MB", "Cài đặt"}) do
     local button = App.new("TextButton", {
         Size = UDim2.fromOffset(100, 46), BackgroundColor3 = index == 1 and C.purple or C.row,
         BorderSizePixel = 0, Text = title, TextColor3 = C.text, TextWrapped = true,
@@ -2163,7 +2344,7 @@ end)
 pcM1Mode.Visible = App.buildProfile == nil
 App.toggle(homePage, "Kèm Skill 1–4 khi Farm", "farmSkills")
 App.toggle(homePage, "Giữ hướng đánh vào mục tiêu", "farmAim")
-App.toggle(homePage, "Rút khi mất HP / né chiêu đã gán ID", "farmGuard")
+App.toggle(homePage, "Rút khi bị đánh / tránh Counter", "farmGuard")
 App.toggle(homePage, "Né hoạt ảnh chưa gán (thử, dễ né nhầm)", "unknownGuard")
 App.slider(homePage, "Số M1 trước một chiêu", "comboM1", 1, 4, 1)
 App.slider(homePage, "Phạm vi tìm mục tiêu", "targetRange", 50, 1000, 25)
@@ -2399,23 +2580,29 @@ local scanAttributes = App.action(combatPage, "Quét thuộc tính thực của 
 end)
 scanAttributes.LayoutOrder, attributes.LayoutOrder = attributes.LayoutOrder, scanAttributes.LayoutOrder
 
-App.note(counterPage, "Farm có né thử hoạt ảnh Action gần hướng vào mình và rút khi mất HP. Có thể né nhầm emote hoặc bỏ sót đòn. Để nhận diện chính xác M1 / Counter / Ultimate, gán ID thực bên dưới; không có ID TSB đoán sẵn.")
+App.note(counterPage, "Tránh mục tiêu có dấu Counter trong client; không cần nhập ID. Game không gửi dấu đó thì script chưa xác định được counter. Không bảo đảm né mọi Counter / Death Counter.")
+App.counterStatusLabel = App.note(counterPage, App.counterStatus)
+App.toggle(counterPage, "Trong Farm: đọc dấu Counter", "counterSignals")
+App.toggle(counterPage, "Bật né Counter cả khi không Farm", "dodge")
 App.slider(counterPage, "Tầm né hoạt ảnh gần", "guardRange", 5, 15, 1)
 App.slider(counterPage, "Khoảng rút / né", "guardStep", 6, 20, 1)
-App.toggle(counterPage, "Auto Block theo ID đã gán", "block")
-App.toggle(counterPage, "Dodge Counter theo ID đã gán", "dodge")
-App.toggle(counterPage, "Dodge Ultimate theo ID đã gán", "ultDodge")
 App.slider(counterPage, "Bán kính phản ứng (studs)", "radius", 5, 30, 1)
 App.slider(counterPage, "Khoảng rút lui (studs)", "retreat", 15, 80, 1)
 App.cycle(counterPage, "Né Ultimate", {"Ra xa", "Sau lưng"}, function() return App.ultMode end, function(value) App.ultMode = value end)
-local animationIdBox = App.entry(counterPage, "AnimationId (số hoặc rbxassetid://ID)", "")
-local animationLabel = App.entry(counterPage, "Tên chiêu hiển thị trên ESP", "")
+local advancedCounter = App.list(counterPage)
+local advancedCounterToggle = App.action(counterPage, "NÂNG CAO: QUY TẮC HOẠT ẢNH", function() advancedCounter.Visible = not advancedCounter.Visible end)
+advancedCounterToggle.LayoutOrder, advancedCounter.LayoutOrder = advancedCounter.LayoutOrder, advancedCounterToggle.LayoutOrder
+advancedCounter.Visible = false
+App.toggle(advancedCounter, "Auto Block theo hoạt ảnh đã gán", "block")
+App.toggle(advancedCounter, "Dodge Ultimate theo hoạt ảnh đã gán", "ultDodge")
+local animationIdBox = App.entry(advancedCounter, "AnimationId tuỳ chọn", "")
+local animationLabel = App.entry(advancedCounter, "Tên chiêu hiển thị trên ESP", "")
 App.animationKind = "Block"
-App.cycle(counterPage, "Nhóm của ID", {"M1", "Block", "Counter", "Ultimate"}, function() return App.animationKind end, function(value) App.animationKind = value end)
+App.cycle(advancedCounter, "Nhóm của hoạt ảnh", {"M1", "Block", "Counter", "Ultimate"}, function() return App.animationKind end, function(value) App.animationKind = value end)
 local function enteredAnimationId()
     return animationIdBox.Text:match("^%s*(%d+)%s*$") or animationIdBox.Text:match("^%s*rbxassetid://(%d+)%s*$")
 end
-App.rulesLabel = App.note(counterPage, "Chưa gán ID.")
+App.rulesLabel = App.note(advancedCounter, "Chưa thêm quy tắc hoạt ảnh nâng cao.")
 local function rulesSummary()
     local ids, lines = {}, {}
     for id in pairs(App.animations) do table.insert(ids, id) end
@@ -2428,23 +2615,23 @@ local function rulesSummary()
     for flag, category in pairs({block = "Block", dodge = "Counter", ultDodge = "Ultimate"}) do
         local found = false
         for _, rule in pairs(App.animations) do if rule.kind == category then found = true end end
-        if not found then App.flags[flag] = false; if flag == "block" then App.releaseAll("block") end end
+        if not found and (flag ~= "dodge" or not App.flags.counterSignals) then App.flags[flag] = false; if flag == "block" then App.releaseAll("block") end end
     end
     App.refresh()
 end
-App.action(counterPage, "Lưu / cập nhật quy tắc ID", function()
+App.action(advancedCounter, "Lưu / cập nhật quy tắc hoạt ảnh", function()
     local id = enteredAnimationId()
     if not id then App.notify("AnimationId", "Nhập một ID hợp lệ."); return end
     local label = animationLabel.Text:sub(1, 50)
     App.animations[id] = {kind = App.animationKind, label = label ~= "" and label or ("ID " .. id)}
     rulesSummary(); App.notify("Đã lưu ID", id .. " → " .. App.animationKind)
 end)
-App.action(counterPage, "Bỏ quy tắc ID trong ô", function()
+App.action(advancedCounter, "Bỏ quy tắc trong ô", function()
     local id = enteredAnimationId()
     if id then App.animations[id] = nil; rulesSummary() end
 end)
-local observedList = App.list(counterPage)
-local observedButton = App.action(counterPage, "Xem hoạt ảnh đã quan sát gần đây", function()
+local observedList = App.list(advancedCounter)
+local observedButton = App.action(advancedCounter, "CHỌN HOẠT ẢNH VỪA QUAN SÁT", function()
     App.emptyList(observedList)
     for _, id in ipairs(App.recentOrder) do
         local candidateId = id
@@ -2460,23 +2647,61 @@ local observedButton = App.action(counterPage, "Xem hoạt ảnh đã quan sát 
 end)
 observedButton.LayoutOrder, observedList.LayoutOrder = observedList.LayoutOrder, observedButton.LayoutOrder
 
-App.note(emotePage, "Phát animation bằng ID có quyền sử dụng. Bản này không mở khóa quyền sở hữu emote VIP, Robux hay sự kiện; không có danh sách emote TSB giả định.")
-local emoteId = App.entry(emotePage, "AnimationId", "")
-local emoteName = App.entry(emotePage, "Tên lưu cho phiên chơi", "")
+App.emoteCatalogLabel = App.note(emotePage, "EMOTE: tự đọc danh sách trong client; chọn theo tên để xem thử. Quyền sở hữu emote trong game không đổi.")
+App.emoteCatalogLabel.LayoutOrder = -20
+local emoteSearch = App.entry(emotePage, "Tìm emote theo tên", "")
+emoteSearch.Parent.LayoutOrder = -19
+local emoteList = App.list(emotePage)
+emoteList.LayoutOrder = -16
+function App.renderEmotes()
+    App.emptyList(emoteList)
+    local filter, count = string.lower(emoteSearch.Text), 0
+    for _, item in ipairs(App.emoteCatalog) do
+        if filter == "" or string.find(string.lower(item.name), filter, 1, true) then
+            count = count + 1
+            if count <= 60 then
+                local emote = item
+                App.action(emoteList, emote.name, function()
+                    if not emote.object.Parent then App.refreshEmotes(); return end
+                    App.stopCombat(); App.showMenu(false); App.playEmote(emote.id, emote.name)
+                end)
+            end
+        end
+    end
+    local total = #App.emoteCatalog
+    App.emoteCatalogLabel.Text = total > 0 and ("EMOTE: " .. tostring(total) .. " mục trong client. " .. (count > 60 and "Gõ tên để lọc; hiện 60 kết quả đầu." or "Chọn tên để xem thử.") .. " Quyền sở hữu trong game không đổi.")
+        or "Chưa thấy Animations/Emotes trong client. Mở emote của game rồi bấm CẬP NHẬT DANH SÁCH; không cần tìm ID."
+    if total > 0 and count == 0 then App.note(emoteList, "Không có emote khớp tên này.") end
+end
+function App.refreshEmotes()
+    App.scanEmotes(); App.renderEmotes()
+    App.emoteCatalogDirty, App.emoteScanAt = false, os.clock()
+end
+local refreshEmotesButton = App.action(emotePage, "CẬP NHẬT DANH SÁCH EMOTE", App.refreshEmotes)
+refreshEmotesButton.LayoutOrder = -18
+local stopEmoteButton = App.action(emotePage, "DỪNG EMOTE", App.stopEmote)
+stopEmoteButton.LayoutOrder = -17
+App.bind(emoteSearch:GetPropertyChangedSignal("Text"), App.renderEmotes)
+App.bind(App.tabs[6].Activated, App.refreshEmotes)
+local advancedEmote = App.list(emotePage)
+local advancedEmoteToggle = App.action(emotePage, "NÂNG CAO: ANIMATION ID TUỲ CHỌN", function() advancedEmote.Visible = not advancedEmote.Visible end)
+advancedEmoteToggle.LayoutOrder, advancedEmote.LayoutOrder = advancedEmote.LayoutOrder, advancedEmoteToggle.LayoutOrder
+advancedEmote.Visible = false
+local emoteId = App.entry(advancedEmote, "AnimationId tuỳ chọn", "")
+local emoteName = App.entry(advancedEmote, "Tên lưu cho phiên chơi", "")
 App.emoteCategory, App.favorites, App.favoriteIndex = "Dance", {}, 0
-App.toggle(emotePage, "Lặp animation", "loopEmote")
-App.cycle(emotePage, "Nhóm lưu thủ công", {"Dance", "Troll", "Flex", "Victory", "Special"}, function() return App.emoteCategory end, function(value) App.emoteCategory = value; App.favoriteIndex = 0 end)
-App.action(emotePage, "Phát ID trong ô", function() App.playEmote(emoteId.Text) end)
-App.action(emotePage, "DỪNG EMOTE", App.stopEmote)
-App.favoriteLabel = App.note(emotePage, "Chưa chọn animation yêu thích.")
-App.action(emotePage, "Lưu ID vào nhóm hiện tại", function()
+App.toggle(advancedEmote, "Lặp animation", "loopEmote")
+App.cycle(advancedEmote, "Nhóm lưu thủ công", {"Dance", "Troll", "Flex", "Victory", "Special"}, function() return App.emoteCategory end, function(value) App.emoteCategory = value; App.favoriteIndex = 0 end)
+App.action(advancedEmote, "Phát ID trong ô", function() App.playEmote(emoteId.Text) end)
+App.favoriteLabel = App.note(advancedEmote, "Chưa chọn animation yêu thích.")
+App.action(advancedEmote, "Lưu ID vào nhóm hiện tại", function()
     local id = emoteId.Text:match("^%s*(%d+)%s*$") or emoteId.Text:match("^%s*rbxassetid://(%d+)%s*$")
     if not id then App.notify("Emote", "Nhập một AnimationId hợp lệ."); return end
     if #App.favorites >= 50 then App.notify("Emote", "Đã đủ 50 mục cho phiên này."); return end
     table.insert(App.favorites, {id = id, kind = App.emoteCategory, name = emoteName.Text ~= "" and emoteName.Text:sub(1, 45) or id})
     App.notify("Đã lưu cho phiên chơi", App.emoteCategory .. " · " .. id)
 end)
-App.action(emotePage, "Chọn mục tiếp theo trong nhóm", function()
+App.action(advancedEmote, "Chọn mục tiếp theo trong nhóm", function()
     local matching = {}
     for _, item in ipairs(App.favorites) do if item.kind == App.emoteCategory then table.insert(matching, item) end end
     if #matching == 0 then App.notify("Emote", "Nhóm này chưa có ID đã lưu."); return end
@@ -2574,6 +2799,7 @@ function App.pauseControls(message)
     App.releaseAll(); App.goal = nil; App.pendingAction = nil; App.farmReady = false; App.restore("aim")
     App.preflightMatches, App.comboCount, App.m1Misses, App.selfAction = 0, 0, 0, nil
     App.probeNextAt, App.combatQuietUntil = os.clock() + 0.8, 0
+    App.toolSlots, App.toolScanAt = {}, -math.huge
     if not App.flags.farm then App.flags.lock, App.flags.m1, App.flags.skills = false, false, false end
     App.flags.block = false
     App.flags.fly, App.flags.speed, App.flags.stabilize = false, false, false
@@ -2660,6 +2886,13 @@ end)
 App.bind(Lighting.DescendantAdded, function(object)
     if App.flags.potato then table.insert(App.queue, object) end
 end)
+if Replicated then
+    App.bind(Replicated.DescendantAdded, function(object)
+        if object.Name == "Emotes" or (object:IsA("Animation") and App.emoteSourceFolder and object:IsDescendantOf(App.emoteSourceFolder)) then
+            App.emoteCatalogDirty = true
+        end
+    end)
+end
 local function watchCamera()
     if App.cameraConnection then App.cameraConnection:Disconnect() end
     local camera = World.CurrentCamera
@@ -2699,6 +2932,9 @@ App.bind(Run.Heartbeat, function(dt)
     if suspended and not App.suspended then App.pauseControls("Đang dùng menu Roblox hoặc mất focus.") end
     App.suspended = suspended
     if not suspended then
+        if now - App.counterScanAt >= 0.04 then
+            App.counterScanAt = now; App.try("Dấu Counter", App.counterSignalTick, now)
+        end
         local followOk, followError = App.try("Bám mục tiêu", App.followTick, now)
         if not followOk and App.flags.farm then App.stopFarm("Lỗi bám mục tiêu: " .. tostring(followError):sub(1, 140), true) end
         local moveOk, moveError = App.try("Di chuyển client", App.movementTick, dt, now)
@@ -2706,6 +2942,9 @@ App.bind(Run.Heartbeat, function(dt)
     end
     if now - App.logicAt >= 0.04 then
         App.logicAt = now
+        if App.emoteCatalogDirty and App.panel.Visible and App.pages[6].Visible and now - (App.emoteScanAt or -math.huge) > 1 then
+            App.try("Danh sách emote", App.refreshEmotes)
+        end
         if not suspended then
             if now - (App.lastReactionScan or -math.huge) >= 0.15 then
                 App.lastReactionScan = now; App.try("Counter / Block", App.reactionTick, now)
@@ -2718,7 +2957,7 @@ App.bind(Run.Heartbeat, function(dt)
     end
     App.try("Tối ưu đồ họa", App.workQueue)
 end)
-watchCamera(); App.updateRoster(); App.refreshBindings(); App.refresh(); App.applyTheme(); App.showMenu(false)
+watchCamera(); App.updateRoster(); App.refreshBindings(); App.refreshEmotes(); App.refresh(); App.applyTheme(); App.showMenu(false)
 task.spawn(App.loadWallpaper)
 App.notify("UwUNCTT " .. VERSION .. " · Farm " .. App.farmProfile, "FARM: thả tay để thử auto tại chỗ. Thao tác tay không tính là auto.")
 return App
