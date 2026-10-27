@@ -1,5 +1,5 @@
 --[[
-UwUNCTT 2.4 | Credits: nctt | Live emote catalog, counter signals, native skill tools
+UwUNCTT 2.4.1 | Credits: nctt | M1 pacing, confirmed skill chains and input fallback
 
 PHẠM VI THỰC TẾ
   Đây là menu client tự dựng, không tải UI hay thư viện từ bên ngoài.
@@ -18,6 +18,8 @@ THIẾT LẬP COMBAT
   Auto M1 / 1–4 chỉ gửi input hoặc gọi handler nút game; server quyết định
   cooldown, đánh trúng, sát thương và kill. Không tự bỏ qua cooldown server.
   Chiêu ưu tiên Tool thật khớp tên hotbar / thuộc tính Slot; không đoán thứ tự Tool.
+  Tool không có phản hồi sẽ thử nút skill thật, Mobile không dùng phím PC.
+  Chuỗi M1 → 1–4 chuyển bước theo hoạt ảnh; chưa phải tech riêng từng nhân vật.
   Counter đọc dấu Counter dạng boolean / Folder có trong client, không cần nhập ID.
   Tín hiệu không được game gửi xuống thì chưa nhận diện được; không bảo đảm né hết.
   Quy tắc hoạt ảnh theo ID vẫn có trong mục nâng cao, không phải bước bắt buộc.
@@ -46,7 +48,7 @@ API references:
 ]]
 
 -- 01. Services, capability detection, runtime ownership.
-local VERSION = "2.4"
+local VERSION = "2.4.1"
 local LaunchProfile = ...
 if LaunchProfile ~= "PC" and LaunchProfile ~= "Mobile" then LaunchProfile = nil end
 local Players = game:GetService("Players")
@@ -121,6 +123,8 @@ local App = {
     attempts = {}, interruptedActions = 0, combatQuietUntil = 0, selfAction = nil,
     recoveryCount = 0, recoveryWindow = -math.huge, recovering = false,
     toolSlots = {}, toolScanAt = -math.huge, actionBackends = {}, emoteCatalog = {},
+    skillPaths = {}, skillStatus = {}, comboMode = "Nối 1→2→3→4", comboStage = "M1",
+    comboStep = 1, comboTargetId = nil, comboFailures = {},
     counterScanAt = -math.huge, counterHolds = 0, counterStatus = "Chưa thấy dấu Counter ở gần.",
     reactedTracks = setmetatable({}, {__mode = "k"}), guardAt = -math.huge,
     logicAt = 0, groundAt = 0, localAt = 0, espAt = 0, fpsFrames = 0, fpsTime = 0, fps = 0,
@@ -136,7 +140,7 @@ local App = {
     },
     values = {
         speed = 28, fly = 48, travel = 115, radius = 18, distance = 3.5,
-        retreat = 30, voidY = -50, m1Gap = 0.24, skillGap = 0.45,
+        retreat = 30, voidY = -50, m1Gap = 0.24, skillGap = 0.2,
         espDistance = 500, fpsCap = 120, dashLength = 12,
         targetRange = 500, attackRange = 6.5, teleInterval = 0.2, guiFade = 55,
         comboM1 = 3, feedbackWait = 0.9, guardRange = 10, guardStep = 10,
@@ -230,6 +234,7 @@ end
 -- 02. Input adapter. No RemoteEvents or assumed TSB endpoints.
 local virtualKeys = {One = 0x31, Two = 0x32, Three = 0x33, Four = 0x34, F = 0x46}
 local skillSlots = {One = "1", Two = "2", Three = "3", Four = "4"}
+local skillKeys = {"One", "Two", "Three", "Four"}
 function App.isMobile()
     if App.flags.farm then return App.farmProfile == "Mobile" end
     if App.buildProfile then return App.buildProfile == "Mobile" end
@@ -337,6 +342,12 @@ end
 local function toolLabel(text)
     return string.lower(tostring(text or "")):gsub("’", ""):gsub("[^%w]", "")
 end
+function App.hotbarSlot(key)
+    local hud = PlayerGui:FindFirstChild("Hotbar")
+    local pack = hud and hud:FindFirstChild("Backpack")
+    local bar = pack and pack:FindFirstChild("Hotbar")
+    return bar and skillSlots[key] and bar:FindFirstChild(skillSlots[key]) or nil
+end
 function App.skillTool(key)
     if not skillSlots[key] then return nil end
     local backpack, character = Me:FindFirstChild("Backpack"), Me.Character
@@ -349,11 +360,8 @@ function App.skillTool(key)
                 if object:IsA("Tool") then table.insert(tools, object) end
             end
         end
-        local hud = PlayerGui:FindFirstChild("Hotbar")
-        local pack = hud and hud:FindFirstChild("Backpack")
-        local bar = pack and pack:FindFirstChild("Hotbar")
         for action, slot in pairs(skillSlots) do
-            local scope = (bar and bar:FindFirstChild(slot)) or App.actionButton(action)
+            local scope = App.hotbarSlot(action) or App.actionButton(action)
             local names = {}; labels[action] = names
             if scope then
                 local objects = scope:GetDescendants(); table.insert(objects, scope)
@@ -381,11 +389,27 @@ function App.skillTool(key)
     if tool and (tool.Parent == backpack or tool.Parent == character) then return tool end
     return nil
 end
+function App.skillPath(key, tool)
+    local state = App.skillPaths[key]
+    if not state or state.tool ~= tool then
+        state = {tool=tool, skipToolUntil=0, toolMatches=0, toolTimeouts=0}
+        App.skillPaths[key] = state
+    end
+    return state
+end
 function App.pressSkillTool(key)
     local tool = App.skillTool(key)
     if not tool then return nil end
     if tool.Enabled == false then return nil, "Chiêu đang bị vô hiệu / hồi: " .. tool.Name end
     if tool.RequiresHandle and not tool:FindFirstChild("Handle") then return nil, "Tool thiếu Handle: " .. tool.Name end
+    local path = App.skillPath(key, tool)
+    if os.clock() < path.skipToolUntil then return nil end
+    if path.preferAlternative then
+        local button = App.actionButton(key)
+        local route = App.routeStates[key]
+        if not App.isMobile() or (button and not (route and route.button == button and route.index > #route.choices)) then return nil end
+        path.preferAlternative = false
+    end
     local character, humanoid = App.parts(Me)
     local backpack = Me:FindFirstChild("Backpack")
     if not humanoid or not backpack then return nil end
@@ -402,6 +426,9 @@ function App.pressSkillTool(key)
         pcall(function() humanoid:UnequipTools() end)
         if previous and previous.Parent == backpack then pcall(function() humanoid:EquipTool(previous) end) end
     end
+    if App.pendingAction and App.pendingAction.key == key then
+        App.pendingAction.backend, App.pendingAction.tool = "Tool", tool
+    end
     local ok, reason = pcall(function()
         humanoid:EquipTool(tool)
         assert(tool.Parent == character, "Tool chưa được trang bị")
@@ -409,6 +436,8 @@ function App.pressSkillTool(key)
     end)
     if not ok then
         release(); App.inputFailures.Tool = tostring(reason):sub(1, 180)
+        path.skipToolUntil = os.clock() + 8
+        if App.pendingAction then App.pendingAction.track, App.pendingAction.observedAt = nil, nil end
         return nil
     end
     App.inputBackend = "Tool · " .. key .. " · " .. tool.Name
@@ -565,7 +594,9 @@ function App.pressGameButton(key)
         local choice = state.choices[state.index]
         if not choice then App.lastInputError = "Đã thử hết cách gọi nút " .. key .. "; chưa có phản hồi auto."; return nil end
         local route = choice.route
-        if App.pendingAction and App.pendingAction.key == key then App.pendingAction.route = choice end
+        if App.pendingAction and App.pendingAction.key == key then
+            App.pendingAction.route, App.pendingAction.backend = choice, "GUI"
+        end
         App.inputFailures.Callback, App.inputFailures.GUI = nil, nil
         local function emit(signal, ...) return App.emitGuiAs(choice.method, signal, ...) end
         local x, y = button.AbsolutePosition.X + button.AbsoluteSize.X / 2, button.AbsolutePosition.Y + button.AbsoluteSize.Y / 2
@@ -584,6 +615,7 @@ function App.pressGameButton(key)
         else sent = emit(button.Activated, App.lastTouch, 1) end
         if sent then
             App.inputBackend = "Mobile · " .. key .. " · " .. route .. " / " .. choice.method
+            if skillSlots[key] then App.actionBackends[key] = App.inputBackend end
             return release or function() end
         end
         App.routeFailure(key, choice, App.inputFailures.Callback or App.inputFailures.GUI or "Callback không chạy")
@@ -691,14 +723,18 @@ function App.press(key, duration, owner)
         local code = Enum.KeyCode[key]
         if not code then return false, "Phím không hỗ trợ", true end
         if VIM and not App.rejected.keyboard then
-            local ok = pcall(function() VIM:SendKeyEvent(true, code, false, game) end)
-            if ok then release = function() VIM:SendKeyEvent(false, code, false, game) end
+            local ok, result = pcall(function() return VIM:SendKeyEvent(true, code, false, game) end)
+            if ok and result ~= false then
+                release = function() VIM:SendKeyEvent(false, code, false, game) end
+                App.inputBackend = "PC · " .. key .. " · VirtualInputManager"
             else App.rejected.keyboard = true end
         end
         if not release and Caps.keydown and Caps.keyup and virtualKeys[key] and not App.rejected.keyPair then
             local vk = virtualKeys[key]
-            local ok = pcall(Caps.keydown, vk)
-            if ok then release = function() Caps.keyup(vk) end
+            local ok, result = pcall(Caps.keydown, vk)
+            if ok and result ~= false then
+                release = function() Caps.keyup(vk) end
+                App.inputBackend = "PC · " .. key .. " · keypress/release"
             else pcall(Caps.keyup, vk); App.rejected.keyPair = true end
         end
     end
@@ -707,6 +743,10 @@ function App.press(key, duration, owner)
         return false, App.lastInputError, true
     end
     App.inputs[key] = {release = release, untilTime = os.clock() + duration, owner = owner}
+    if skillSlots[key] then
+        App.actionBackends[key] = App.inputBackend
+        if App.pendingAction then App.pendingAction.backend = "PC" end
+    end
     return true
 end
 function App.inputTick(now)
@@ -1011,9 +1051,14 @@ function App.actionBusy(now)
     App.selfAction = nil
     return nil
 end
+function App.resetCombo(targetId)
+    App.comboCount, App.comboStep, App.comboStage = 0, 1, "M1"
+    App.comboTargetId, App.comboFailures = targetId, {}
+end
 function App.interruptCombat(now, reason, quiet)
     if App.pendingAction then App.interruptedActions = App.interruptedActions + 1 end
     App.pendingAction, App.selfAction, App.m1Misses, App.comboCount = nil, nil, 0, 0
+    App.resetCombo()
     App.releaseAll("combat"); App.restore("aim")
     if App.goal and App.goal.priority == 10 then App.goal = nil end
     App.combatQuietUntil = math.max(App.combatQuietUntil, now + (quiet or 0.35))
@@ -1042,18 +1087,32 @@ function App.confirmAction(source)
             if state then state.timeouts = 0 end
             if App.preflightMatches >= 2 then App.farmReady, App.recovering = true, false end
         end
-        if pending.phase ~= "preflight" then App.comboCount = App.comboCount + 1 end
+        if pending.phase ~= "preflight" and (not pending.targetId or pending.targetId == App.comboTargetId) then
+            App.comboCount = App.comboCount + 1
+        end
     else
         local state = App.routeStates[pending.key]
         if state and pending.route == state.choices[state.index] then state.matches = state.matches + 1 end
-        App.comboCount = 0
+        local path = App.skillPath(pending.key, pending.tool or App.skillTool(pending.key))
+        if pending.backend == "Tool" then path.toolMatches, path.toolTimeouts = path.toolMatches + 1, 0
+        else path.preferAlternative = true end
+        App.skillStatus[pending.key] = "Có hoạt ảnh · " .. (App.actionBackends[pending.key] or pending.backend or "input")
+        if not pending.targetId or pending.targetId == App.comboTargetId then
+            if App.flags.farm and App.comboMode == "Nối 1→2→3→4" and App.comboStage == "Skills" and pending.comboStep == App.comboStep then
+                App.comboStep = App.comboStep + 1
+            else App.resetCombo(App.comboTargetId) end
+        end
     end
     if pending.track then
         local speed = math.max(0.1, tonumber(pending.track.Speed) or 1)
         local length = tonumber(pending.track.Length) or 0
-        local duration = length > 0 and length / speed or (pending.key == "M1" and 0.4 or 0.9)
+        local position = tonumber(pending.track.TimePosition) or math.max(0, os.clock() - pending.observedAt) * speed
+        local duration = length > 0 and math.max(0, length - position) / speed or 0.9
+        -- M1 can accept another input before its visual tail ends. Do not stop/edit the track.
+        local readyAt = pending.key == "M1" and (pending.at + math.max(App.values.m1Gap, App.flags.safe and 0.45 or 0.18))
+            or (os.clock() + math.clamp(duration, 0.12, 10))
         App.selfAction = {track=pending.track, key=pending.key,
-            untilTime=pending.observedAt + math.clamp(duration, 0.12, pending.key == "M1" and 0.8 or 3)}
+            untilTime=readyAt}
     end
     return true
 end
@@ -1071,14 +1130,20 @@ end
 function App.sendCombat(key, now, phase)
     local _, humanoid = App.parts(Me)
     App.pendingAction = {key = key, at = now, phase = phase, health = humanoid and humanoid.Health or 0,
-        generated = true, epoch = App.inputEpoch}
+        generated = true, epoch = App.inputEpoch, targetId = App.current, comboStep = App.comboStep}
     local ok, reason, fatal = App.press(key, 0.065, "combat")
     if ok then
         App.attempts[key] = (App.attempts[key] or 0) + 1
         App.lastAction = now
         if key == "M1" then App.farmSent = App.farmSent + 1; App.lastAttack = now
-        else App.lastSkill = now; App.skillRetry[key] = now + 1.6; App.comboCount = 0 end
-    else App.pendingAction = nil end
+        else App.lastSkill = now; App.skillRetry[key] = now + 1.6 end
+    else
+        App.pendingAction = nil
+        if skillSlots[key] then
+            App.comboFailures[key] = (App.comboFailures[key] or 0) + 1
+            App.skillStatus[key], App.skillRetry[key] = reason or "Không gửi được chiêu", now + 0.15
+        end
+    end
     return ok, reason, fatal
 end
 function App.retreatFrom(player, now, reason)
@@ -1105,6 +1170,7 @@ function App.retreatFrom(player, now, reason)
 end
 function App.pauseFarm(reason, withdraw)
     App.flags.farmPaused = true; App.pendingAction = nil; App.releaseAll(); App.restore("aim")
+    App.resetCombo()
     if App.goal and App.goal.priority == 10 then App.goal = nil end
     if withdraw then App.retreatFrom(App.current and Players:GetPlayerByUserId(App.current), os.clock(), reason) end
     App.farmReport("FARM ĐÃ TẠM DỪNG", reason)
@@ -1165,9 +1231,21 @@ function App.feedbackTick(now)
             elseif App.m1Misses >= 3 then
                 App.recoverFarmInput(now)
             end
-        elseif pending.route then
-            local state = App.routeStates[pending.key]
-            if state and state.matches == 0 then App.routeFailure(pending.key, pending.route, "Chiêu chưa có phản hồi auto") end
+        elseif skillSlots[pending.key] then
+            App.comboFailures[pending.key] = (App.comboFailures[pending.key] or 0) + 1
+            App.skillRetry[pending.key] = now + 0.15
+            App.skillStatus[pending.key] = "Chưa có hoạt ảnh · " .. (pending.backend or "input") .. "; sẽ thử đường khác"
+            if pending.backend == "Tool" then
+                local path = App.skillPath(pending.key, pending.tool)
+                path.toolTimeouts = path.toolTimeouts + 1
+                if path.toolMatches == 0 or path.toolTimeouts >= 2 then path.skipToolUntil = now + 8 end
+            elseif pending.route then
+                local state = App.routeStates[pending.key]
+                if state then
+                    state.timeouts = state.timeouts + 1
+                    if state.matches == 0 or state.timeouts >= 2 then App.routeFailure(pending.key, pending.route, "Chiêu chưa có phản hồi auto") end
+                end
+            end
         end
     end
 end
@@ -1197,31 +1275,96 @@ function App.preflightTick(now)
     else App.farmReport("THỬ AUTO " .. tostring(App.preflightMatches) .. "/2", "Đang tự thử M1 tại chỗ. Không chạm nút đánh / chiêu.") end
     return App.farmReady
 end
-function App.buttonCooling(button)
-    if not button then return true end
-    for _, child in ipairs(button:GetDescendants()) do
+function App.buttonCooling(button, key)
+    -- TSB may place the cooldown next to Base, rather than inside the button.
+    local scope = App.hotbarSlot(key) or button
+    if not scope then return true end
+    local function visible(object)
+        local node = object
+        while node and node ~= PlayerGui do
+            if node:IsA("GuiObject") and node.Visible == false then return false end
+            if node:IsA("ScreenGui") and node.Enabled == false then return false end
+            node = node.Parent
+        end
+        return true
+    end
+    local objects = scope:GetDescendants(); table.insert(objects, scope)
+    for _, child in ipairs(objects) do
         local name = string.lower(child.Name):gsub("[^%w]", "")
-        if name == "cooldown" or name == "cooldowntext" or name == "cooldowntimer" then
+        if (name == "cooldown" or name == "cooldowntext" or name == "cooldowntimer") and visible(child) then
             if child:IsA("TextLabel") or child:IsA("TextButton") then
                 local value = tonumber(child.Text)
-                if child.Visible and value and value > 0 then return true end
-            elseif child:IsA("GuiObject") and child.Visible and child.AbsoluteSize.Y > 1 then return true end
+                if value and value > 0 then return true end
+            elseif child:IsA("GuiObject") and child.AbsoluteSize.Y > 1 then
+                local texts = false
+                for _, part in ipairs(child:GetDescendants()) do
+                    if part:IsA("TextLabel") or part:IsA("TextButton") then
+                        texts = true
+                        if visible(part) and (tonumber(part.Text) or 0) > 0 then return true end
+                    end
+                end
+                if not texts then
+                    local opaque = (child.BackgroundTransparency or 1) < 0.98
+                    if child:IsA("ImageLabel") or child:IsA("ImageButton") then opaque = opaque or (child.ImageTransparency or 1) < 0.98 end
+                    if opaque then return true end
+                end
+            end
         end
     end
     return false
 end
+function App.skillReady(key, now)
+    local button, tool = App.actionButton(key), App.skillTool(key)
+    if tool and tool.Enabled == false then return false, "Tool đang hồi / bị khóa" end
+    if (button or App.hotbarSlot(key)) and App.buttonCooling(button, key) then return false, "Hotbar đang hồi chiêu" end
+    if now < (App.skillRetry[key] or 0) then return false, "Chờ thử lại" end
+    if tool then
+        local path = App.skillPath(key, tool)
+        if now >= path.skipToolUntil and not path.preferAlternative then return true end
+    end
+    if not App.isMobile() then return true end
+    if button then
+        local route = App.routeStates[key]
+        if not route or route.button ~= button or route.index <= #route.choices then return true end
+    end
+    if tool then
+        local path = App.skillPath(key, tool)
+        if now >= path.skipToolUntil then path.preferAlternative = false; return true end
+    end
+    return false, "Chưa có đường gửi chiêu khả dụng"
+end
 function App.nextSkill(now)
-    local keys = {"One", "Two", "Three", "Four"}
     for offset = 0, 3 do
         local index = (App.skillIndex - 1 + offset) % 4 + 1
-        local key = keys[index]
-        local button, tool = App.actionButton(key), App.skillTool(key)
-        local ready = (not button or not App.buttonCooling(button)) and ((tool and tool.Enabled ~= false) or (App.isMobile() and button) or not App.isMobile())
-        if now >= (App.skillRetry[key] or 0) and ready then
+        local key = skillKeys[index]
+        if App.skillReady(key, now) then
             App.skillIndex = index % 4 + 1; return key
         end
     end
     return nil
+end
+function App.nextComboSkill(now)
+    if not App.flags.farm then return App.nextSkill(now), false end
+    if App.comboStage == "M1" then
+        if App.comboCount < App.values.comboM1 then return nil, false end
+        App.comboStage, App.comboStep, App.comboFailures = "Skills", 1, {}
+    end
+    if App.comboMode ~= "Nối 1→2→3→4" then
+        local key = App.nextSkill(now)
+        if not key then App.resetCombo(App.comboTargetId) end
+        return key, key ~= nil
+    end
+    while App.comboStep <= #skillKeys do
+        local key = skillKeys[App.comboStep]
+        local failures = App.comboFailures[key] or 0
+        local ready, reason = App.skillReady(key, now)
+        if failures < 2 and ready then return key, true end
+        if failures > 0 and failures < 2 and reason == "Chờ thử lại" then return nil, true end
+        if not App.skillStatus[key] or failures == 0 then App.skillStatus[key] = reason or "Bỏ qua trong chuỗi này" end
+        App.comboStep = App.comboStep + 1
+    end
+    App.resetCombo(App.comboTargetId)
+    return nil, false
 end
 function App.startFarm(profile, testOnly)
     profile = profile or App.buildProfile or App.farmProfile
@@ -1234,6 +1377,7 @@ function App.startFarm(profile, testOnly)
     App.routeStates, App.routeLog, App.inputFailureReport = {}, {}, nil
     App.attempts, App.interruptedActions, App.combatQuietUntil, App.selfAction = {}, 0, 0, nil
     App.toolSlots, App.toolScanAt, App.actionBackends, App.counterHolds = {}, -math.huge, {}, 0
+    App.skillPaths, App.skillStatus = {}, {}; App.resetCombo()
     App.recoveryCount, App.recoveryWindow, App.recovering, App.lastInterruption = 0, -math.huge, false, nil
     App.probeNextAt = os.clock() + 0.8
     if App.diagnosticLabel then App.diagnosticLabel.Visible = false end
@@ -1259,6 +1403,7 @@ function App.stopFarm(reason, failed)
     App.flags.lock, App.flags.m1, App.flags.skills = false, false, false
     App.releaseAll("combat"); App.pendingAction = nil; App.farmReady = false; App.counterThreat = nil; App.restore("aim")
     App.selfAction, App.recovering = nil, false
+    App.resetCombo()
     if App.goal and App.goal.priority == 10 then App.goal = nil end
     App.current = nil
     App.farmReport(failed and "INPUT KHÔNG KHẢ DỤNG" or "ĐÃ DỪNG", reason or "Bấm BẮT ĐẦU AUTO FARM.")
@@ -1274,6 +1419,7 @@ function App.diagnostics()
         "M1 có hoạt ảnh: " .. tostring(App.confirmed.M1) .. " | input đã kiểm tra: " .. tostring(App.farmReady),
         "Thử không chạm: " .. tostring(App.preflightMatches) .. "/2 | lần bị thao tác tay hủy: " .. tostring(App.manualCancels),
         "Chiêu 1–4: " .. tostring(App.flags.farmSkills) .. " | né hoạt ảnh chưa gán: " .. tostring(App.flags.unknownGuard),
+        "Chuỗi: " .. App.comboMode .. " | " .. App.comboStage .. " " .. tostring(App.comboStep) .. " | M1 nối: " .. tostring(App.comboCount),
         "Đòn bị ngắt: " .. tostring(App.interruptedActions) .. " | kiểm tra lại M1: " .. tostring(App.recoveryCount) .. "/3",
         "Lý do ngắt: " .. tostring(App.lastInterruption or "Chưa có"),
         "Counter: " .. App.counterStatus .. " | lần tránh: " .. tostring(App.counterHolds),
@@ -1290,6 +1436,7 @@ function App.diagnostics()
         if skillSlots[key] then
             local tool = App.skillTool(key)
             table.insert(lines, "  Tool: " .. (tool and tool.Name or "Chưa khớp slot") .. " | " .. (App.actionBackends[key] or "Chưa dùng Tool"))
+            table.insert(lines, "  Trạng thái: " .. (App.skillStatus[key] or "Chưa thử"))
         end
         if button then
             local ok, path = pcall(function() return button:GetFullName() end)
@@ -1590,6 +1737,7 @@ function App.combatTick(now)
     local _, humanoid, myRoot = App.parts(Me)
     if not myRoot then
         App.farmReady, App.pendingAction = false, nil
+        App.resetCombo()
         App.releaseAll("combat"); App.current = nil
         if App.goal and App.goal.priority == 10 then App.goal = nil end
         if App.flags.farm then App.farmReport("CHỜ HỒI SINH", "Nhân vật chưa sẵn sàng; sẽ tìm mục tiêu sau khi hồi sinh.") end
@@ -1599,6 +1747,7 @@ function App.combatTick(now)
         if App.selfHumanoid ~= humanoid then
             App.selfHumanoid, App.selfHealth, App.farmReady, App.pendingAction = humanoid, humanoid.Health, false, nil
             App.preflightMatches, App.m1Misses, App.comboCount, App.selfAction = 0, 0, 0, nil
+            App.resetCombo()
             App.probeNextAt = now + 0.8
         elseif humanoid.Health < (App.selfHealth or humanoid.Health) then
             App.selfHealth = humanoid.Health
@@ -1639,10 +1788,12 @@ function App.combatTick(now)
     local _, targetHumanoid, root = App.parts(target)
     if not root then
         App.releaseAll("combat")
+        App.resetCombo()
         if App.goal and App.goal.priority == 10 then App.goal = nil end
         if App.flags.farm then App.farmReport("CHỜ MỤC TIÊU", "Chưa có mục tiêu còn sống trong phạm vi / cờ nộ phù hợp.") end
         return
     end
+    if App.comboTargetId ~= target.UserId then App.resetCombo(target.UserId) end
     local distance = (root.Position - myRoot.Position).Magnitude
     local ownAction = App.actionBusy(now)
     if App.flags.lock and not App.flags.fly and (not ownAction or ownAction == "M1") then
@@ -1675,14 +1826,15 @@ function App.combatTick(now)
     end
     for _, held in pairs(App.inputs) do if held.owner == "combat" then return end end
     -- Dispatch a single action per tick: do not stomp a skill with M1 in the same frame.
-    if App.flags.skills and (not App.flags.farm or App.comboCount >= App.values.comboM1)
-        and now - App.lastSkill >= math.max(App.values.skillGap, App.flags.safe and 0.8 or 0.25) then
-        local key = App.nextSkill(now)
+    if App.flags.skills then
+        local key, waiting = App.nextComboSkill(now)
         if key then
-            App.skillRetry[key] = now + 0.8
+            if now - App.lastSkill < math.max(App.values.skillGap, App.flags.safe and 0.8 or 0.12) then return end
             local ok = App.sendCombat(key, now, "combo")
-            if ok then return end
+            if not ok and App.flags.farm then App.farmReport("CHỜ CHIÊU " .. skillSlots[key], App.skillStatus[key], target, distance) end
+            return
         end
+        if waiting then return end
     end
     if App.flags.m1 and now - App.lastAttack >= math.max(App.values.m1Gap, App.flags.safe and 0.45 or 0.18) then
         App.lastAttack = now
@@ -1840,6 +1992,7 @@ function App.stopCombat()
     App.flags.farm, App.flags.farmPaused = false, false
     App.flags.m1, App.flags.skills, App.flags.block, App.flags.lock = false, false, false, false
     App.releaseAll(); App.goal = nil; App.pendingAction = nil; App.farmReady = false; App.restore("aim")
+    App.selfAction = nil; App.resetCombo()
     App.farmReport("ĐÃ DỪNG", "Thao tác điều khiển khác đã dừng Farm.")
     App.refresh()
 end
@@ -1891,6 +2044,11 @@ function App.setFlag(key, enabled)
     App.flags[key] = enabled
     if key == "farmSkills" and App.flags.farm then App.flags.skills = enabled end
     if key == "skills" and App.flags.farm then App.flags.farmSkills = enabled end
+    if (key == "farmSkills" or key == "skills") and not enabled then
+        for _, action in ipairs(skillKeys) do App.release(action) end
+        if App.pendingAction and skillSlots[App.pendingAction.key] then App.pendingAction = nil end
+        App.resetCombo(App.current)
+    end
     if key == "potato" or key == "fragments" then App.queueScan()
     elseif key == "bright" then App.refreshLighting()
     elseif key == "esp" and not enabled then App.clearESP()
@@ -1910,6 +2068,7 @@ function App.stopAll(message)
     App.releaseAll(); App.stopFly(); App.stopEmote(); App.goal = nil; App.pauseUntil = 0
     App.pendingAction, App.farmReady, App.counterThreat = nil, false, nil
     App.selfAction, App.combatQuietUntil, App.recovering = nil, 0, false
+    App.resetCombo()
     App.queue, App.queueIndex, App.keys = {}, 1, {}
     local groups = {}
     for name in pairs(App.bags) do table.insert(groups, name) end
@@ -2277,6 +2436,7 @@ function App.showMenu(visible)
         App.captureAction = nil
         if App.goal and App.goal.priority == 10 then App.goal = nil end
         App.releaseAll(); App.pendingAction = nil; App.restore("aim")
+        App.resetCombo()
         if App.flags.farm and not App.flags.farmPaused then App.farmReport("TẠM DỪNG", "Thu gọn menu hoặc bấm TIẾP TỤC để chạy lại.") end
     end
     App.refresh()
@@ -2323,7 +2483,10 @@ function App.refreshFarmUI()
     App.primaryFarm.Text = App.flags.farm and (App.flags.farmPaused and "KIỂM TRA LẠI & TIẾP TỤC" or "DỪNG FARM " .. profile) or "BẮT ĐẦU FARM " .. profile
     App.primaryFarm.BackgroundColor3 = App.flags.farm and C.red or C.purple
     App.resumeFarm.Text = App.flags.farm and "TIẾP TỤC • THU GỌN MENU" or "BẮT ĐẦU VỚI CÀI ĐẶT HIỆN TẠI"
-    App.farmStatusLabel.Text = App.farmPhase .. "\n" .. App.farmReason .. "\nMục tiêu: " .. targetText .. distance .. "\nM1 thử: " .. tostring(App.farmSent) .. " · có hoạt ảnh: " .. tostring(App.confirmed.M1) .. " · " .. App.inputBackend
+    local skills = 0
+    for _, key in ipairs(skillKeys) do skills = skills + (App.confirmed[key] or 0) end
+    App.farmStatusLabel.Text = App.farmPhase .. "\n" .. App.farmReason .. "\nMục tiêu: " .. targetText .. distance
+        .. "\nHoạt ảnh M1: " .. tostring(App.confirmed.M1) .. "/" .. tostring(App.farmSent) .. " lần gửi · Chiêu: " .. tostring(skills)
     floatingFarm.Text = App.flags.farm and (App.flags.farmPaused and "TIẾP TỤC" or "DỪNG FARM") or "FARM " .. (profile == "MOBILE" and "MB" or "PC")
     floatingFarm.BackgroundColor3 = App.flags.farm and C.red or C.row
     App.farmBadge.Visible = App.flags.farm and not App.panel.Visible
@@ -2343,6 +2506,10 @@ local pcM1Mode = App.cycle(homePage, "Cách gửi M1 trên PC", {"Tự động",
 end)
 pcM1Mode.Visible = App.buildProfile == nil
 App.toggle(homePage, "Kèm Skill 1–4 khi Farm", "farmSkills")
+App.cycle(homePage, "Nhịp combo", {"Nối 1→2→3→4", "M1 + 1 chiêu"}, function() return App.comboMode end, function(value)
+    App.comboMode = value; App.interruptCombat(os.clock(), "Đổi nhịp combo", 0.15)
+end)
+App.note(homePage, "Nối chiêu: M1 → chiêu sẵn sàng theo thứ tự 1–4. Chỉ chuyển bước khi có hoạt ảnh; chưa phải tech riêng từng nhân vật hay xác nhận đánh trúng.")
 App.toggle(homePage, "Giữ hướng đánh vào mục tiêu", "farmAim")
 App.toggle(homePage, "Rút khi bị đánh / tránh Counter", "farmGuard")
 App.toggle(homePage, "Né hoạt ảnh chưa gán (thử, dễ né nhầm)", "unknownGuard")
@@ -2471,6 +2638,7 @@ function App.handleTouch(input)
                 if object == button or object:IsDescendantOf(button) then
                     App.manualUntil = os.clock() + (key == "M1" and 0.25 or 0.65)
                     App.releaseAll("combat")
+                    App.resetCombo()
                     return
                 end
             end
@@ -2543,7 +2711,7 @@ App.action(combatPage, "KHÓA + ĐÁNH + COMBO NGƯỜI ĐÃ CHỌN", function()
 App.slider(combatPage, "Khoảng cách sau lưng", "distance", 3, 10, 0.5)
 App.toggle(combatPage, "Kèm Skill 1–4 trong Farm", "farmSkills")
 App.slider(combatPage, "Khoảng cách giữa M1 (giây)", "m1Gap", 0.2, 1.5, 0.05)
-App.slider(combatPage, "Khoảng cách giữa phím skill", "skillGap", 0.25, 2, 0.05)
+App.slider(combatPage, "Khoảng nghỉ tối thiểu giữa chiêu", "skillGap", 0.12, 2, 0.02)
 App.note(combatPage, "Chọn mục tiêu hoặc chế độ Gần nhất. Auto input tự ẩn menu. Mouse API trên PC cần con trỏ ở vùng chơi. Cooldown, damage và kill do máy chủ quyết định.")
 App.toggle(combatPage, "Đổi mục tiêu khi cờ nộ khớp", "switchAwake")
 App.toggle(combatPage, "Cờ thiếu = không nộ (tự lựa chọn)", "missingInactive")
@@ -2798,6 +2966,7 @@ function App.pauseControls(message)
     local wasActive = App.flags.farm or App.flags.fly or App.flags.speed or App.flags.lock or App.flags.m1 or App.flags.skills or App.flags.block
     App.releaseAll(); App.goal = nil; App.pendingAction = nil; App.farmReady = false; App.restore("aim")
     App.preflightMatches, App.comboCount, App.m1Misses, App.selfAction = 0, 0, 0, nil
+    App.resetCombo()
     App.probeNextAt, App.combatQuietUntil = os.clock() + 0.8, 0
     App.toolSlots, App.toolScanAt = {}, -math.huge
     if not App.flags.farm then App.flags.lock, App.flags.m1, App.flags.skills = false, false, false end
@@ -2940,7 +3109,7 @@ App.bind(Run.Heartbeat, function(dt)
         local moveOk, moveError = App.try("Di chuyển client", App.movementTick, dt, now)
         if not moveOk and App.flags.farm then App.stopFarm("Lỗi di chuyển: " .. tostring(moveError):sub(1, 140), true) end
     end
-    if now - App.logicAt >= 0.04 then
+    if now - App.logicAt >= 0.025 then
         App.logicAt = now
         if App.emoteCatalogDirty and App.panel.Visible and App.pages[6].Visible and now - (App.emoteScanAt or -math.huge) > 1 then
             App.try("Danh sách emote", App.refreshEmotes)
