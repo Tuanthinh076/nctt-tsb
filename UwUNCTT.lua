@@ -1,5 +1,5 @@
 --[[
-UwUNCTT 2.4.1 | Credits: nctt | M1 pacing, confirmed skill chains and input fallback
+UwUNCTT 2.4.2 | Credits: nctt | Skill cast lifetime and animation feedback fallback
 
 PHẠM VI THỰC TẾ
   Đây là menu client tự dựng, không tải UI hay thư viện từ bên ngoài.
@@ -48,7 +48,7 @@ API references:
 ]]
 
 -- 01. Services, capability detection, runtime ownership.
-local VERSION = "2.4.1"
+local VERSION = "2.4.2"
 local LaunchProfile = ...
 if LaunchProfile ~= "PC" and LaunchProfile ~= "Mobile" then LaunchProfile = nil end
 local Players = game:GetService("Players")
@@ -125,6 +125,7 @@ local App = {
     toolSlots = {}, toolScanAt = -math.huge, actionBackends = {}, emoteCatalog = {},
     skillPaths = {}, skillStatus = {}, comboMode = "Nối 1→2→3→4", comboStage = "M1",
     comboStep = 1, comboTargetId = nil, comboFailures = {},
+    skillEquipment = {}, feedbackLatency = {},
     counterScanAt = -math.huge, counterHolds = 0, counterStatus = "Chưa thấy dấu Counter ở gần.",
     reactedTracks = setmetatable({}, {__mode = "k"}), guardAt = -math.huge,
     logicAt = 0, groundAt = 0, localAt = 0, espAt = 0, fpsFrames = 0, fpsTime = 0, fps = 0,
@@ -248,12 +249,23 @@ function App.release(key)
     App.inputs[key] = nil
     pcall(held.release)
 end
+function App.releaseSkillEquipment(key)
+    local lease = App.skillEquipment[key]
+    if not lease then return end
+    App.skillEquipment[key] = nil
+    pcall(lease.restore)
+end
 function App.releaseAll(owner)
     local keys = {}
     for key, held in pairs(App.inputs) do
         if not owner or owner == held.owner then table.insert(keys, key) end
     end
     for _, key in ipairs(keys) do App.release(key) end
+    if not owner or owner == "combat" then
+        local leases = {}
+        for key in pairs(App.skillEquipment) do table.insert(leases, key) end
+        for _, key in ipairs(leases) do App.releaseSkillEquipment(key) end
+    end
 end
 function App.visibleGameButton(button)
     if not button or not button.Parent or not button:IsA("GuiButton") then return false end
@@ -413,15 +425,20 @@ function App.pressSkillTool(key)
     local character, humanoid = App.parts(Me)
     local backpack = Me:FindFirstChild("Backpack")
     if not humanoid or not backpack then return nil end
+    App.releaseSkillEquipment(key)
     local previous, epoch = nil, App.inputEpoch
     for _, object in ipairs(character:GetChildren()) do if object:IsA("Tool") and object ~= tool then previous = object; break end end
-    local released = false
+    local released, restored, changed = false, false, tool.Parent ~= character
     local function release()
         if released then return end
         released = true
         pcall(function() tool:Deactivate() end)
+    end
+    local function restore()
+        if restored then return end
+        restored = true; release()
         -- Restore only our selection; a later physical input/selection takes precedence.
-        if epoch ~= App.inputEpoch or Me.Character ~= character or tool.Parent ~= character then return end
+        if not changed or epoch ~= App.inputEpoch or Me.Character ~= character or tool.Parent ~= character then return end
         for _, object in ipairs(character:GetChildren()) do if object:IsA("Tool") and object ~= tool then return end end
         pcall(function() humanoid:UnequipTools() end)
         if previous and previous.Parent == backpack then pcall(function() humanoid:EquipTool(previous) end) end
@@ -430,19 +447,25 @@ function App.pressSkillTool(key)
         App.pendingAction.backend, App.pendingAction.tool = "Tool", tool
     end
     local ok, reason = pcall(function()
-        humanoid:EquipTool(tool)
+        if changed then humanoid:EquipTool(tool) end
         assert(tool.Parent == character, "Tool chưa được trang bị")
         tool:Activate()
     end)
     if not ok then
-        release(); App.inputFailures.Tool = tostring(reason):sub(1, 180)
+        restore(); App.inputFailures.Tool = tostring(reason):sub(1, 180)
         path.skipToolUntil = os.clock() + 8
         if App.pendingAction then App.pendingAction.track, App.pendingAction.observedAt = nil, nil end
         return nil
     end
     App.inputBackend = "Tool · " .. key .. " · " .. tool.Name
     App.actionBackends[key] = App.inputBackend
-    return release
+    if App.pendingAction and App.pendingAction.key == key then
+        App.skillEquipment[key] = {restore=restore, tool=tool, character=character, epoch=epoch,
+            expireAt=os.clock() + App.values.feedbackWait + 0.1}
+        -- Release the button separately. Unequipping during a delayed cast can cancel it.
+        return release
+    end
+    return restore
 end
 function App.hasGameHandler(button)
     if not Caps.connections then return nil end
@@ -760,6 +783,15 @@ function App.inputTick(now)
         if now >= held.untilTime then table.insert(expired, key) end
     end
     for _, key in ipairs(expired) do App.release(key) end
+    local finished = {}
+    for key, lease in pairs(App.skillEquipment) do
+        local action = lease.action
+        local done = lease.epoch ~= App.inputEpoch or lease.character ~= Me.Character or lease.tool.Parent ~= lease.character
+        if not done and action then done = not action.track.IsPlaying or now >= action.untilTime
+        elseif not done then done = now >= lease.expireAt end
+        if done then table.insert(finished, key) end
+    end
+    for _, key in ipairs(finished) do App.releaseSkillEquipment(key) end
 end
 
 -- 03. Local movement. Interpolation is not an anti-cheat bypass.
@@ -1029,7 +1061,7 @@ function App.actionAnimation(track)
     local priority = track.Priority and track.Priority.Name or ""
     if priority ~= "Action" and priority ~= "Action2" and priority ~= "Action3" and priority ~= "Action4" then return false end
     local name = string.lower(track.Animation and track.Animation.Name or "")
-    for _, word in ipairs({"idle", "walk", "run", "jump", "fall", "swim", "emote", "dance", "pose", "stun", "hurt", "ragdoll"}) do
+    for _, word in ipairs({"idle", "walk", "run", "jump", "fall", "swim", "emote", "dance", "pose", "stun", "hurt", "ragdoll", "equip"}) do
         if name:find(word, 1, true) then return false end
     end
     return true
@@ -1074,6 +1106,7 @@ function App.confirmAction(source)
     App.pendingAction = nil
     App.confirmed[pending.key] = (App.confirmed[pending.key] or 0) + 1
     App.feedbackSource, App.feedbackAt = source, os.clock()
+    if pending.observedAt then App.feedbackLatency[pending.key] = math.max(0, pending.observedAt - pending.at) end
     if pending.key == "M1" then
         App.m1Misses = 0
         local state = App.routeStates.M1
@@ -1092,7 +1125,7 @@ function App.confirmAction(source)
         end
     else
         local state = App.routeStates[pending.key]
-        if state and pending.route == state.choices[state.index] then state.matches = state.matches + 1 end
+        if state and pending.route == state.choices[state.index] then state.matches, state.timeouts = state.matches + 1, 0 end
         local path = App.skillPath(pending.key, pending.tool or App.skillTool(pending.key))
         if pending.backend == "Tool" then path.toolMatches, path.toolTimeouts = path.toolMatches + 1, 0
         else path.preferAlternative = true end
@@ -1113,12 +1146,14 @@ function App.confirmAction(source)
             or (os.clock() + math.clamp(duration, 0.12, 10))
         App.selfAction = {track=pending.track, key=pending.key,
             untilTime=readyAt}
+        local lease = App.skillEquipment[pending.key]
+        if lease and lease.tool == pending.tool then lease.action = App.selfAction end
     end
     return true
 end
 function App.observeSelf(track)
     local pending = App.pendingAction
-    if not pending or not pending.generated or pending.epoch ~= App.inputEpoch
+    if not pending or pending.observedAt or not pending.generated or pending.epoch ~= App.inputEpoch
         or os.clock() < App.manualUntil or os.clock() - pending.at > App.values.feedbackWait then return end
     local _, humanoid = App.parts(Me)
     if humanoid and humanoid.Health >= pending.health and App.actionAnimation(track) then
@@ -1127,11 +1162,36 @@ function App.observeSelf(track)
         pending.track = track
     end
 end
-function App.sendCombat(key, now, phase)
+function App.selfTracks(humanoid)
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+    local ok, tracks = pcall(function() return animator:GetPlayingAnimationTracks() end)
+    if not ok or type(tracks) ~= "table" then return nil end
+    return tracks, animator
+end
+function App.pollSelf(pending)
+    if not pending or pending.observedAt or not pending.previousTracks or pending.character ~= Me.Character then return end
     local _, humanoid = App.parts(Me)
+    local tracks, animator = App.selfTracks(humanoid)
+    if animator ~= pending.animator then return end
+    for index, track in ipairs(tracks or {}) do
+        if index > 32 then break end
+        if track.IsPlaying and not pending.previousTracks[track] and App.actionAnimation(track) then
+            App.observeSelf(track)
+            if pending.observedAt then pending.polled = true; return end
+        end
+    end
+end
+function App.sendCombat(key, now, phase)
+    local character, humanoid = App.parts(Me)
+    local tracks, animator = App.selfTracks(humanoid)
+    local previousTracks = tracks and {} or nil
+    for _, track in ipairs(tracks or {}) do previousTracks[track] = true end
     App.pendingAction = {key = key, at = now, phase = phase, health = humanoid and humanoid.Health or 0,
-        generated = true, epoch = App.inputEpoch, targetId = App.current, comboStep = App.comboStep}
-    local ok, reason, fatal = App.press(key, 0.065, "combat")
+        generated = true, epoch = App.inputEpoch, targetId = App.current, comboStep = App.comboStep,
+        character=character, animator=animator, previousTracks=previousTracks}
+    local hold = key == "M1" and math.clamp(App.values.m1Gap * 0.6, 0.09, 0.16) or 0.1
+    local ok, reason, fatal = App.press(key, hold, "combat")
     if ok then
         App.attempts[key] = (App.attempts[key] or 0) + 1
         App.lastAction = now
@@ -1209,8 +1269,10 @@ function App.feedbackTick(now)
         App.interruptCombat(now, "Đòn bị ngắt bởi sát thương hoặc trạng thái nhân vật", 0.35)
         return
     end
+    if pending then App.pollSelf(pending) end
     if pending and pending.observedAt and now - pending.observedAt >= 0.06 then
-        if App.confirmAction("Auto: phản hồi khi không có thao tác tay xen vào") then return end
+        if App.confirmAction(pending.polled and "Auto: đọc track mới đang chạy; không có thao tác tay xen vào"
+            or "Auto: sự kiện hoạt ảnh; không có thao tác tay xen vào") then return end
     end
     if pending and now - pending.at >= App.values.feedbackWait then
         App.pendingAction = nil
@@ -1232,6 +1294,7 @@ function App.feedbackTick(now)
                 App.recoverFarmInput(now)
             end
         elseif skillSlots[pending.key] then
+            App.release(pending.key); App.releaseSkillEquipment(pending.key)
             App.comboFailures[pending.key] = (App.comboFailures[pending.key] or 0) + 1
             App.skillRetry[pending.key] = now + 0.15
             App.skillStatus[pending.key] = "Chưa có hoạt ảnh · " .. (pending.backend or "input") .. "; sẽ thử đường khác"
@@ -1377,7 +1440,7 @@ function App.startFarm(profile, testOnly)
     App.routeStates, App.routeLog, App.inputFailureReport = {}, {}, nil
     App.attempts, App.interruptedActions, App.combatQuietUntil, App.selfAction = {}, 0, 0, nil
     App.toolSlots, App.toolScanAt, App.actionBackends, App.counterHolds = {}, -math.huge, {}, 0
-    App.skillPaths, App.skillStatus = {}, {}; App.resetCombo()
+    App.skillPaths, App.skillStatus, App.feedbackLatency = {}, {}, {}; App.resetCombo()
     App.recoveryCount, App.recoveryWindow, App.recovering, App.lastInterruption = 0, -math.huge, false, nil
     App.probeNextAt = os.clock() + 0.8
     if App.diagnosticLabel then App.diagnosticLabel.Visible = false end
@@ -1433,6 +1496,7 @@ function App.diagnostics()
         local button = App.actionButton(key)
         table.insert(lines, key .. ": " .. (button and button.Name or "Chưa gán") .. " / " .. (App.buttonModes[key] or "Tự động")
             .. " | gửi " .. tostring(App.attempts[key] or 0) .. " / hoạt ảnh " .. tostring(App.confirmed[key] or 0))
+        if App.feedbackLatency[key] then table.insert(lines, "  Trễ phản hồi gần nhất: " .. string.format("%.0f ms", App.feedbackLatency[key] * 1000)) end
         if skillSlots[key] then
             local tool = App.skillTool(key)
             table.insert(lines, "  Tool: " .. (tool and tool.Name or "Chưa khớp slot") .. " | " .. (App.actionBackends[key] or "Chưa dùng Tool"))
@@ -1447,6 +1511,12 @@ function App.diagnostics()
                 table.insert(lines, "  Cách gọi " .. tostring(state.index) .. "/" .. tostring(#state.choices) .. " | phản hồi: " .. tostring(state.matches) .. " | chưa phản hồi: " .. tostring(state.timeouts))
             end
         end
+    end
+    local pending, action = App.pendingAction, App.selfAction
+    if pending then table.insert(lines, "Đang chờ input " .. pending.key .. ": " .. string.format("%.2f/%.2f giây", os.clock() - pending.at, App.values.feedbackWait)) end
+    if action then
+        local name = action.track.Animation and action.track.Animation.Name or "Animation"
+        table.insert(lines, "Đang chờ hoạt ảnh " .. action.key .. " / " .. name .. ": còn " .. string.format("%.2f giây", math.max(0, action.untilTime - os.clock())))
     end
     for _, line in ipairs(App.routeLog) do table.insert(lines, line) end
     for key, value in pairs(App.inputFailures) do table.insert(lines, key .. ": " .. tostring(value):sub(1, 180)) end
@@ -2045,7 +2115,7 @@ function App.setFlag(key, enabled)
     if key == "farmSkills" and App.flags.farm then App.flags.skills = enabled end
     if key == "skills" and App.flags.farm then App.flags.farmSkills = enabled end
     if (key == "farmSkills" or key == "skills") and not enabled then
-        for _, action in ipairs(skillKeys) do App.release(action) end
+        for _, action in ipairs(skillKeys) do App.release(action); App.releaseSkillEquipment(action) end
         if App.pendingAction and skillSlots[App.pendingAction.key] then App.pendingAction = nil end
         App.resetCombo(App.current)
     end
